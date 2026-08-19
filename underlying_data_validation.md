@@ -121,7 +121,7 @@ Which success field to use as the dashboard population filter: `attempt_login_su
 | `session_login_success = TRUE` | 73.35% | 23.58% of attempts have `session_id IS NULL` → classified as failed |
 
 ### Why `session_login_success` is wrong for this use case
-`session_login_success` comes from `fact_account_access_flows` via a LEFT JOIN. 23.58% of rows have `session_id IS NULL` (`has_session_match = FALSE`) because `fact_account_access_flows` lags up to 48 hours and the table's 3h incremental window doesn't wait. Those rows get `session_login_success = NULL`, which a `WHERE session_login_success = TRUE` filter drops — creating a ~25% undercount.
+`session_login_success` comes from `fact_account_access_flows` via a LEFT JOIN. 23.58% of rows in `risk.test.siyu_login_sessions` have `session_id IS NULL` (`has_session_match = FALSE`) because `fact_account_access_flows` lags up to 48 hours and the table's 3h incremental window doesn't wait for it. Those rows are inserted with `session_id = NULL` and `session_login_success = NULL`, which a `WHERE session_login_success = TRUE` filter drops — creating a ~25% undercount.
 
 ### Remaining gaps explained (0.27% ≈ 8,900/day)
 
@@ -140,16 +140,19 @@ Which success field to use as the dashboard population filter: `attempt_login_su
 ### Dashboard population definition (final)
 ```sql
 WHERE attempt_login_success = TRUE
+  AND session_id IS NOT NULL
 ```
+Rows with `session_id IS NULL` (`has_session_match = FALSE`) are excluded — they represent attempts not yet matched by `fact_account_access_flows` and cannot be confirmed as complete login sessions.
+
 Volume count (App + Web = total):
 ```sql
-COUNT(DISTINCT COALESCE(session_id, account_access_attempt_id))
+COUNT(DISTINCT session_id)
 ```
-Sessions where `session_id` is not null are counted once per session. Attempts with `session_id IS NULL` are counted individually (no over-count since each has a unique `account_access_attempt_id`).
+Each session is counted once, regardless of how many attempts it contains.
 
 ### Hex cell update status (2026-08-19)
 
-All 16 dashboard cells migrated to `risk.test.siyu_login_sessions` with `attempt_login_success = TRUE` and `COALESCE(session_id, account_access_attempt_id)` volume counts.
+All 16 dashboard cells migrated to `risk.test.siyu_login_sessions` with `attempt_login_success = TRUE AND session_id IS NOT NULL` and `COUNT(DISTINCT session_id)` volume counts.
 
 | Cell ID | Variable | Status |
 |---|---|---|
@@ -371,8 +374,8 @@ Joins any `JOURNEY_LOGIN` event for the user within 24h — not the specific mis
 | Priority | Fix | Status | PR / Notes |
 |---|---|---|---|
 | **P0** | Create `risk.test.siyu_login_sessions` stable table | **Done** — DDL run manually; 30-day backfill inserted; hourly task pending PR merge | [#80910](https://github.com/1debit/chime-tf/pull/80910) (SQL), [#80911](https://github.com/1debit/chime-tf/pull/80911) (TF) |
-| **P0.1** | Validate population field and align all 16 Hex cells | **Done** — `attempt_login_success = TRUE` selected (99.73% legacy-equivalent); 15/16 cells updated via CLI; `di_arrival_latency` cell needs manual update | See §P0.1 above |
-| **P1** | Pin single "successful login" definition across all cells | In progress | All 16 base cells now use `siyu_login_sessions WHERE attempt_login_success = TRUE`; remaining orphaned Q-cells (Q2–Q8) to be cleaned up under P13 |
+| **P0.1** | Validate population field and align all 16 Hex cells | **Done** — `attempt_login_success = TRUE AND session_id IS NOT NULL`; 15/16 cells updated via CLI; `di_arrival_latency` cell needs manual update | See §P0.1 above |
+| **P1** | Pin single "successful login" definition across all cells | In progress | All 16 base cells now use `siyu_login_sessions WHERE attempt_login_success = TRUE AND session_id IS NOT NULL`; remaining orphaned Q-cells (Q2–Q8) to be cleaned up under P13 |
 | **P2** | Replace DI×flows user+hour join with `decision_id` join | Pending | Q6, Q7, PI cells: `di.DECISION_ID = s.decision_id AND s.attempt_login_success = TRUE` |
 | **P3** | Add `< CURRENT_DATE` upper bound to all cells | Pending | ConnectionMix, Q9, SystemLanguage, Q4–Q8, NetworkVpnRates, Behavioral, DeviceType/Model, coverage cells |
 | **P4** | Fix DI Coverage `di_decisions` filters | Pending | Add `EVENT_NAME`, `SUB_EVENT_NAME`, `SESSION_EVENT`, `IS_SHADOW_MODE = FALSE` |
