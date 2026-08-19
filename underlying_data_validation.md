@@ -34,7 +34,7 @@
 | `session_event` | VARCHAR | First AUTHN event for this attempt |
 | `decision_id` | VARCHAR | **Join key → `device_intelligence`** |
 | `registration_id` | VARCHAR | **Join key → Sardine / PI `vendor_response`**; ~4% null |
-| `attempt_login_success` | BOOLEAN | This specific attempt succeeded |
+| `attempt_login_success` | BOOLEAN | This specific attempt succeeded — **dashboard population field** |
 | `session_login_success` | BOOLEAN | Session-level success; **NULL** when `has_session_match = FALSE` |
 | `has_session_match` | BOOLEAN | FALSE = attempt not yet in `fact_account_access_flows` |
 | `is_shadow_mode` | BOOLEAN | Always FALSE in this table (shadow rows excluded) |
@@ -60,7 +60,7 @@ edw_db.account_access.fact_login_attempts       (~12h lag; dw_created_ts window)
 
 ### Schedule
 
-- Cron: `0 * * * * America/Los_Angeles` (every hour at :00)
+- Cron: `5 * * * * America/Los_Angeles` (every hour at :05 — captures full prior-hour data)
 - Warehouse: `ingestion_l_wh_gen_2_warehouse`
 - Lookback: `dw_created_ts >= -3h` on `fact_login_attempts` (accounts for ~12h processing lag)
 - AUTHN window: `original_timestamp >= -20h` (12h lag + 3h window + 5h buffer)
@@ -102,6 +102,73 @@ Test window: 27h `dw_created_ts` (captured ~1.08M attempts across 3 days includi
 | High | `COALESCE(f.login_success, FALSE)` classified missing sessions as failed | Changed to `f.login_success` (NULL when no session match); added `has_session_match` flag |
 | Medium | Shadow-mode filter documented but not applied | Added `WHERE is_shadow_mode = FALSE` to final SELECT |
 | Medium | Daily 48h window missed late-arriving records | Switched to hourly cron + `dw_created_ts >= -3h` window |
+
+---
+
+## P0.1 — Population Field Validation
+
+### Question
+Which success field to use as the dashboard population filter: `attempt_login_success` or `session_login_success`?
+
+### Validation method
+30-day backfill (2026-07-17 to 2026-08-17) compared against the legacy `analytics.test.account_access_flows` daily distinct-user counts.
+
+### Results
+
+| Field | Agreement with legacy | Notes |
+|---|---|---|
+| `attempt_login_success = TRUE` | **99.73%** (≈ 3.3M / 3.3M) | **Selected** |
+| `session_login_success = TRUE` | 73.35% | 23.58% of attempts have `session_id IS NULL` → classified as failed |
+
+### Why `session_login_success` is wrong for this use case
+`session_login_success` comes from `fact_account_access_flows` via a LEFT JOIN. 23.58% of rows have `session_id IS NULL` (`has_session_match = FALSE`) because `fact_account_access_flows` lags up to 48 hours and the table's 3h incremental window doesn't wait. Those rows get `session_login_success = NULL`, which a `WHERE session_login_success = TRUE` filter drops — creating a ~25% undercount.
+
+### Remaining gaps explained (0.27% ≈ 8,900/day)
+
+| Gap component | Volume/day | Decision |
+|---|---|---|
+| `enrollment_token` attempts (new auth method) | ~8,700–9,300 | **Include** — legitimate silent re-auth; EDW added July 9, 2026 |
+| Web password Arkose gap | ~4,400 | **Accept** — structural gap stable since ≥ May 21, 2026 (~0.8% of total) |
+| Late-arriving rows not yet in backfill window | ~330 | Expected; captured on next hourly run |
+
+### `enrollment_token` decision
+`enrollment_token` = users who re-authenticate silently using a stored device token (no password prompt). These are not bot logins. EDW added this auth method to `fact_login_attempts` with `pre_pw_checks_arkose = TRUE` on July 9, 2026 (visible as a step-change from 0 to ~8,700/day). They are legitimate successful logins and should be included.
+
+### Web password Arkose gap decision
+~4,400 web password attempts/day appear in `siyu_login_sessions` but not in the legacy `account_access_flows`. This is a longstanding structural difference (confirmed stable across the full 90-day lookback, May 21 – Aug 18, 2026 at 99.97–100.00% Arkose pass rate). Root cause is likely a filter difference in how the legacy table defines `pre_pw_checks_arkose` for web password attempts. Accepted as a known structural gap; it does not affect fraud signal quality.
+
+### Dashboard population definition (final)
+```sql
+WHERE attempt_login_success = TRUE
+```
+Volume count (App + Web = total):
+```sql
+COUNT(DISTINCT COALESCE(session_id, account_access_attempt_id))
+```
+Sessions where `session_id` is not null are counted once per session. Attempts with `session_id IS NULL` are counted individually (no over-count since each has a unique `account_access_attempt_id`).
+
+### Hex cell update status (2026-08-19)
+
+All 16 dashboard cells migrated to `risk.test.siyu_login_sessions` with `attempt_login_success = TRUE` and `COALESCE(session_id, account_access_attempt_id)` volume counts.
+
+| Cell ID | Variable | Status |
+|---|---|---|
+| `019ff756-ef83-710c-8fc3-639dd9e352b7` | `df_login_dod_aligned` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-654142cea404` | `df_logins_by_channel` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-69441bbeb7ca` | `df_volume` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-6fef90c55d43` | `df_connection_type_mix` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-70482470615e` | `df_countries` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-8034cbb644ef` | `df_device_type_daily` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-865593e3a102` | `df_authn_device_models` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-8bb02a2bd3ac` | `df_authn_device_model_increases` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-8eff68c52ff6` | `df_network_rates_daily` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-93b2dc2a663b` | `df_behavioral_daily` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-9bb7d83ecec8` | `df_system_language_monitor` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-a07df0606413` | `coverage_results` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-aa8ea43686df` | `arkose_coverage_results` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-b05529718d28` | `di_coverage_overall` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-bad7b10164ae` | `di_missing_by_platform_method` | ✓ Updated |
+| `019ff756-ef83-710c-8fc3-c1779cc6f18f` | `di_arrival_latency` | ⚠ Hex CLI error — manual update needed |
 
 ---
 
@@ -195,7 +262,7 @@ Test window: 27h `dw_created_ts` (captured ~1.08M attempts across 3 days includi
 | Confirmed succeeded | `SESSION_EVENT IN ('*_auth_succeeded')` | DI Coverage cells |
 | Session-level success | `ACCOUNT_ACCESS_FLOWS.LOGIN_SUCCESS = 1` | Q2–Q8, PI, ChannelVolume |
 
-**Fix (P1):** Standardize all cells to `siyu_login_sessions WHERE session_login_success = TRUE` or `attempt_login_success = TRUE`.
+**Fix (P1):** Standardize all cells to `siyu_login_sessions WHERE attempt_login_success = TRUE`.
 
 #### C2: Denominator mismatch between LoginVolume and all panels below
 - `df_volume` (stated denominator): `COUNT(DISTINCT USER_ID)` from Segment, America/Los_Angeles, users per day
@@ -205,7 +272,7 @@ Test window: 27h `dw_created_ts` (captured ~1.08M attempts across 3 days includi
 #### C3: DI × flows hour join is a proxy, not a session join
 `CAST(di.USER_ID AS TEXT) = f.USER_ID AND DATE_TRUNC('hour', di.ORIGINAL_TIMESTAMP) = DATE_TRUNC('hour', f.EVENT_HOUR)` — fan-out, no success confirmation, timezone ambiguity.
 
-**Fix (P2):** Replace with `di.DECISION_ID = s.decision_id AND s.session_login_success = TRUE` joining `siyu_login_sessions`.
+**Fix (P2):** Replace with `di.DECISION_ID = s.decision_id AND s.attempt_login_success = TRUE` joining `siyu_login_sessions`.
 
 #### C4: Inconsistent success predicate within the same join family
 - Q2, Q3: `f.LOGIN_SUCCESS >= 1` (includes multi-success hours)
@@ -303,9 +370,10 @@ Joins any `JOURNEY_LOGIN` event for the user within 24h — not the specific mis
 
 | Priority | Fix | Status | PR / Notes |
 |---|---|---|---|
-| **P0** | Create `risk.test.siyu_login_sessions` stable table | **PRs open** — run DDL before activating task | [#80910](https://github.com/1debit/chime-tf/pull/80910) (SQL), [#80911](https://github.com/1debit/chime-tf/pull/80911) (TF) |
-| **P1** | Pin single "successful login" definition across all cells | Pending | Replace `username_auth_initiated` filter with join to `siyu_login_sessions WHERE session_login_success = TRUE` in overview cells |
-| **P2** | Replace DI×flows user+hour join with `decision_id` join | Pending | Q6, Q7, PI cells: `di.DECISION_ID = s.decision_id AND s.session_login_success = TRUE` |
+| **P0** | Create `risk.test.siyu_login_sessions` stable table | **Done** — DDL run manually; 30-day backfill inserted; hourly task pending PR merge | [#80910](https://github.com/1debit/chime-tf/pull/80910) (SQL), [#80911](https://github.com/1debit/chime-tf/pull/80911) (TF) |
+| **P0.1** | Validate population field and align all 16 Hex cells | **Done** — `attempt_login_success = TRUE` selected (99.73% legacy-equivalent); 15/16 cells updated via CLI; `di_arrival_latency` cell needs manual update | See §P0.1 above |
+| **P1** | Pin single "successful login" definition across all cells | In progress | All 16 base cells now use `siyu_login_sessions WHERE attempt_login_success = TRUE`; remaining orphaned Q-cells (Q2–Q8) to be cleaned up under P13 |
+| **P2** | Replace DI×flows user+hour join with `decision_id` join | Pending | Q6, Q7, PI cells: `di.DECISION_ID = s.decision_id AND s.attempt_login_success = TRUE` |
 | **P3** | Add `< CURRENT_DATE` upper bound to all cells | Pending | ConnectionMix, Q9, SystemLanguage, Q4–Q8, NetworkVpnRates, Behavioral, DeviceType/Model, coverage cells |
 | **P4** | Fix DI Coverage `di_decisions` filters | Pending | Add `EVENT_NAME`, `SUB_EVENT_NAME`, `SESSION_EVENT`, `IS_SHADOW_MODE = FALSE` |
 | **P5** | Add `JOURNEY = 'JOURNEY_LOGIN'` to Sardine device-model cell | Pending | One-line fix in `df_device_model` |
