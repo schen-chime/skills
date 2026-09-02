@@ -44,10 +44,12 @@ Source: ATOM v204 production policy configuration (effective May 2026). All thre
 | Band | Score Range | Default Outcome | Example Policy Name |
 |---|---|---|---|
 | Step-Down | ATOM < 0.03 (v183) / < 0.07 (v204) | `step_down` → OTP issued | `login___atom_v3_stepdown_0_07_threshold` |
-| Pass | 0.07 – 0.70 | `default` (no additional challenge) | standard flow |
+| Pass | 0.07 – 0.70 | `default` (password + OTP required — both must pass) | standard flow |
 | Step-Up OTP | 0.70 – 0.98 | `step_up_otp` | bounded by adjacent rules |
 | Scan ID | > 0.98 | `scan_id` / `document_upload` | `login_v1_2___atom_v3__0_98` |
 | Hard Block | N/A — deterministic | `hard_block` | device/attribute rules, not score-based |
+
+**`default` outcome = password + OTP:** `DECISION_OUTCOME = 'default'` in AUTHN is **not** a no-challenge pass — it is the standard two-factor login requiring the member to enter their password and confirm an OTP sent to the phone on file. To verify whether the OTP was confirmed, join AUTHN with STEP_UP_PLATFORM by user_id and timestamp proximity: `USER_DECISION = 'confirmed'` = OTP passed; `'denied'` = OTP failed. If the phone number was changed before the fraud date, a `default` session with a confirmed OTP on a fraud device means the OTP was routed to and confirmed by the fraudster.
 
 **Key distinction:** Velocity, geo, and PII-update rules can trigger challenges (`scan_id`, `last4`, `step_down`) at any ML score. Always separate ML-triggered from rule-triggered outcomes when presenting to an external audience.
 
@@ -105,6 +107,8 @@ WHERE s.USER_ID = '<USER_ID_STR>'
   AND s.ORIGINAL_TIMESTAMP >= DATEADD('day', -90, CURRENT_DATE)
 ORDER BY s.ORIGINAL_TIMESTAMP;
 ```
+
+**USER_DECISION values:** `confirmed` = OTP/in-app challenge passed; `denied` = challenge failed. Multiple `denied` → `confirmed` on the same fraud device = fraudster retrying OTP until they received the code (e.g., after a Phase 1 phone change rerouted OTP to their number).
 
 ### Query C — Disputed transactions (full detail)
 ```sql
@@ -246,23 +250,40 @@ Key signals:
 - `DECISION_OUTCOME = 'allow'` on `phone` or `email` **before** fraud date — likely entry point
 - `REMOTE_CONTROLLED_APPS` not null — remote access app active; strong social engineering signal
 
-### Query H — Phone risk assessment (Neustar signals on new phone numbers)
-Run whenever Query G shows a phone number change.
+### Query H — Phone risk assessment (agent-assisted and self-serve phone changes)
+
+Run whenever Query G shows a phone number change, or if you suspect agent social engineering. This event covers both self-serve app changes and agent-assisted CX calls (`AGENT_INTENT = 'INTENT_PHONE_UPDATE'`).
 
 ```sql
 SELECT
     ORIGINAL_TIMESTAMP,
-    DEVICE_ID,
+    SUB_EVENT,
+    AGENT_INTENT,
     POLICY_NAME,
     POLICY_DECISION,
-    IP_ADDRESS
+    CALLING_NUMBER_ANI,
+    ANI_MATCH,
+    DEVICE_ID,
+    IP_ADDRESS,
+    TRUST_INDICATOR,
+    HIGHLY_PROBABLE_FALSIFIED,
+    VOIP,
+    REASSIGNED_INDICATOR,
+    PREPAID
 FROM CHIME.DECISION_PLATFORM.PHONE_RISK_ASSESSMENT_EVENT
 WHERE USER_ID = '<USER_ID_STR>'
   AND ORIGINAL_TIMESTAMP >= DATEADD('day', -90, CURRENT_DATE)
 ORDER BY ORIGINAL_TIMESTAMP;
 ```
 
-If the column set is unknown, run `DESCRIBE TABLE CHIME.DECISION_PLATFORM.PHONE_RISK_ASSESSMENT_EVENT` first. Key signals: VoIP flag, carrier type, ported-recently flag, country mismatch.
+If the column set is unknown, run `DESCRIBE TABLE CHIME.DECISION_PLATFORM.PHONE_RISK_ASSESSMENT_EVENT` first.
+
+**Policy outcomes to surface:**
+- `step_up_otp` — OTP challenge issued before the phone change is allowed; check whether the OTP was confirmed on a fraud device
+- `no_checks_needed` — change allowed without further challenge; flag as a gap if combined with VoIP, ANI mismatch, or low trust indicator
+- `refer_to_scan_id` — document verification required; triggered for synthetic identity risk or suspended-for-fraud accounts
+
+**Key signals:** `AGENT_INTENT = 'INTENT_PHONE_UPDATE'` = agent-assisted CX call (not self-serve); `ANI_MATCH = false` = caller's number does not match number on file (social engineering indicator); `VOIP = true` = disposable VoIP number; `TRUST_INDICATOR < 300` = high-risk number. A successful phone change with VoIP + ANI mismatch + `POLICY_DECISION = 'no_checks_needed'` is a policy gap worth noting in §5.
 
 ### Query E-fraud — Event-level AUTHN for fraud day only
 
@@ -324,41 +345,83 @@ Always surface complete device UUIDs in the artifact (36-char UUID, not a trunca
 
 ## Output — HTML Artifact
 
-Same CSS token system as `ato-deep-dive.md`. Design differences for beta:
+Write a self-contained HTML file to the scratchpad, then publish it as an artifact titled `"ATO Session Brief · User <USER_ID>"`.
 
-- Primary accent: `--c-info` (blue) for controls that engaged; `--c-ato` (red) for confirmed fraud transactions only
-- Nav bar chips: `chip-neutral` or `chip-info` — no `chip-warn` / `chip-ato` in the header
-- Clock bar colors: amber = probe/login entries, red = transactions, blue = controls/challenges, green = victim sessions
-- No root-cause policy critique section
+### CSS Token System
+
+Use this exact token system — do not substitute different variable names or a dark-first palette. This preserves visual consistency across all beta briefs.
+
+```css
+:root {
+  --bg:#F0F3FA; --surface:#FFFFFF; --card:#FFFFFF;
+  --border:#D2DBF0; --faint:#E8EDF7;
+  --tx1:#0B1223; --tx2:#3A4F7A; --tx3:#7B90BC;
+  --c-ato:#C6350D;    /* confirmed fraud events */
+  --c-legit:#0A8A60;  /* victim / recovery / approved */
+  --c-warn:#B8720A;   /* probe / login attempts / Penny override */
+  --c-info:#2550D4;   /* controls / challenges engaged */
+  --c-neutral:#6B80AA;/* blocked / default outcomes */
+  --c-txn:#7B3DAD;    /* ring / cross-account signal */
+  --shadow:0 1px 4px rgba(11,18,35,.08),0 4px 16px rgba(11,18,35,.05);
+  --r:8px;
+  --mono:'SF Mono','Cascadia Code','Menlo',monospace;
+  --sans:system-ui,-apple-system,sans-serif;
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#07101E; --surface:#0C1627; --card:#111E34;
+  --border:#1C2D4A; --faint:#152036;
+  --tx1:#D8E3F8; --tx2:#8AA4D5; --tx3:#445E90;
+  --c-ato:#F06040; --c-legit:#25D49A; --c-warn:#F5A32A;
+  --c-info:#6898F8; --c-neutral:#8098C0; --c-txn:#C07AEE;
+  --shadow:0 1px 4px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.3);
+}}
+:root[data-theme="light"]{--bg:#F0F3FA;--surface:#FFFFFF;--card:#FFFFFF;--border:#D2DBF0;--faint:#E8EDF7;--tx1:#0B1223;--tx2:#3A4F7A;--tx3:#7B90BC;}
+:root[data-theme="dark"]{--bg:#07101E;--surface:#0C1627;--card:#111E34;--border:#1C2D4A;--faint:#152036;--tx1:#D8E3F8;--tx2:#8AA4D5;--tx3:#445E90;}
+```
+
+Tint semantic colors with `color-mix()` rather than hardcoded hex so they adapt to both themes:
+```css
+/* example: ATO badge */
+background: color-mix(in srgb, var(--c-ato) 15%, transparent);
+color: var(--c-ato);
+border: 1px solid color-mix(in srgb, var(--c-ato) 35%, transparent);
+```
+
+**Chip shape** — use pill chips (`border-radius:99px`) for nav and KPI badges, square badges (`border-radius:4px`) only for table cell tags.
+
+**Nav bar chips** — use `chip-neutral` or `chip-info` classes only. Do not use `chip-ato` or `chip-warn` in the header.
+
+**Clock bar colors** — `--c-warn` (amber) for probe/login entries, `--c-ato` (red) for fraud transactions, `--c-info` (blue) for challenges/controls, `--c-legit` (green) for victim sessions, `--c-txn` (purple) for Penny overrides.
 
 ### §1 — Case Summary
 
-**Victim Information Summary (render first, above the KPI grid)**
+**Victim Profile card (render first, above the KPI grid)**
 
-Before the KPI cards, render a compact victim profile card with the following fields derived from Query A (victim device data), Query D (ATO label), and Query C (dispute records):
+Before the KPI cards, render a compact victim profile card. Style: `border-left: 3px solid var(--c-info)` on a `.card` surface; a small `VICTIM PROFILE` label in `--c-info` mono uppercase; a two-column CSS grid (`140px 1fr`) with uppercase labels in `--tx3` and mono values in `--tx1`. If a field is unavailable, omit that row — do not show "N/A".
+
+Fields, in order:
 
 | Field | Source | Notes |
 |---|---|---|
 | User ID | input | Display in full |
-| Home location | Query A — victim device city/region | Use the city/region from victim-classified devices (low ML, no VPN, home IP) |
-| Victim devices | Query A | List all device UUIDs classified VICTIM DEVICE; show platform and first/last seen |
-| Account age at fraud | Query C earliest dispute date vs. account open date if available | If account open date unavailable, omit |
+| Home location | Query A — victim device city/region | City/region from victim-classified devices (low ML, no VPN, home IP) |
+| Victim devices | Query A | All UUIDs classified VICTIM DEVICE; show platform and first/last seen as sub-text in `--tx3` |
 | ATO confirmed | Query D `ato_confirmed` | Yes / No / Not in label table |
-| ATO contact date | Query D `ato_contact_date` | Date victim called support; derive lag from fraud date |
-| Lag: fraud → contact | Computed | Days between first fraud transaction and ATO contact date |
+| ATO contact date | Query D `ato_contact_date` | Date victim called support |
+| Lag: fraud → contact | Computed | Days between first fraud transaction and ATO contact |
 | Total disputed | Query C | SUM of amounts across all claims |
-| Amount recovered | Query C | SUM of amounts with RESOLUTION_CODE = 'approve' |
-| Amount unrecovered | Computed | Total disputed minus recovered; highlight in red |
-
-Style as a two-column definition list or a bordered card with `--c-info` left accent. Do not use a table with many empty cells — if a field is unavailable, omit that row rather than showing "N/A". Label the card clearly as **Victim Profile** to distinguish it from the KPI summary below.
+| Amount recovered | Query C | SUM of amounts with RESOLUTION_CODE = 'approve'; color in `--c-legit` |
+| Amount unrecovered | Computed | Total minus recovered; color in `--c-ato`; omit row if $0 |
 
 **KPI grid (below Victim Profile)**
 
-6-card KPI grid. Include: total disputed, fraud date + window length, peak ML score + device, distinct attack waves, ATO contact date, victim recovery status.
+6-card grid (`repeat(auto-fill, minmax(155px, 1fr))`). KPI value: mono 22px, bold. Include: total disputed, fraud date + window length, peak ML score + device, distinct attack waves, ATO contact date, victim recovery status.
 
-### §2 — Attack Timeline (Clock Bar)
+### §2 — Attack Timeline (Clock Bar + Event Log)
 
-Visual compressed timeline of the attack window. Pattern from reference:
+**This section has two parts: (A) a clock bar and (B) a detailed event log below it. Both are required — do not render just the clock bar.**
+
+#### A. Clock Bar
 
 ```css
 .clock-wrap{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:16px 20px;box-shadow:var(--shadow)}
@@ -369,12 +432,88 @@ Visual compressed timeline of the attack window. Pattern from reference:
 ```
 
 Steps:
-1. Determine window start (first suspicious AUTHN event) and end (last fraud event or identity change on fraud day)
-2. Map each key event to a % position in that window
-3. Render as `clock-seg` divs with `left` and `width` as % of total window
-4. Use 4 colors only: amber for probe/login entries, red for transactions, blue for challenges/controls, green for victim sessions
-5. Minimum segment width: 3% (for readability)
-6. Add time labels below the bar at start, 25%, 50%, 75%, and end positions
+1. **Window**: from the first suspicious AUTHN event (earliest probe/step_up_otp) to the latest of (ATO contact, victim recovery login, last fraud transaction). Include the full arc — overnight gaps are OK and should show as blank space in the bar.
+2. **Background tint bands**: before individual segments, lay down lightly tinted background bands covering the pre-entry phase (color-mix warn 12%), active fraud phase (color-mix ato 12%), and recovery phase (color-mix legit 14%). These make the phases readable even when segments are small.
+3. **Individual segments**: map every key event to `left` = (minutes_from_start / total_minutes) × 100%. Minimum segment width: 3%.
+4. **Five colors** — amber (`--c-warn`) for probes/logins, red (`--c-ato`) for fraud transactions, blue (`--c-info`) for challenges/controls, purple (`--c-txn`) for Penny overrides, green (`--c-legit`) for victim recovery sessions.
+5. **Tooltip**: set the `title` attribute on each segment with timestamp + event description — the full clock bar serves as a hover-navigation index.
+6. **Labels**: below the bar, show 5 labels — window start, Penny or entry point time, fraud cluster range, any next-day recurrence, window end. Use `justify-content:space-between`.
+
+#### B. Event Log
+
+Below the clock bar, render a chronological event-by-event log inside a `.card`. Every key event from the queries must appear as its own entry — do not group or summarize multiple events into one row. Use date-divider headers (e.g. `Jul 23, 2026`) between days.
+
+**Required CSS:**
+```css
+.tl2{display:flex;gap:0;padding:7px 0;border-bottom:1px solid var(--faint);cursor:pointer}
+.tl2:last-of-type{border-bottom:none}
+.tl2:hover{background:var(--faint)}
+.tl2-dot{width:22px;display:flex;flex-direction:column;align-items:center;padding-top:4px;flex-shrink:0}
+.tl2-d{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.tl2-line{width:1px;flex:1;background:var(--border);margin-top:3px}
+.tl2-body{flex:1;padding:0 8px}
+.tl2-hdr{display:flex;align-items:baseline;flex-wrap:wrap;gap:8px}
+.tl2-ts{font-family:var(--mono);font-size:11px;color:var(--tx3);min-width:52px;flex-shrink:0}
+.tl2-lbl{font-size:13px;font-weight:600;color:var(--tx1)}
+.tl2-chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.tl2-det{display:none;margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--tx2);line-height:1.7;padding:8px 12px;background:var(--faint);border-radius:5px;border-left:2px solid var(--border)}
+.tl2-det.open{display:block}
+```
+
+**Entry structure** — each row is a `<div class="tl2" onclick="this.querySelector('.tl2-det').classList.toggle('open')">`:
+```html
+<div class="tl2" onclick="this.querySelector('.tl2-det').classList.toggle('open')">
+  <div class="tl2-dot">
+    <div class="tl2-d" style="background:var(--c-COLOR)"></div>
+    <div class="tl2-line"></div>  <!-- omit on last entry of a day group -->
+  </div>
+  <div class="tl2-body">
+    <div class="tl2-hdr">
+      <span class="tl2-ts">HH:MM</span>
+      <span class="tl2-lbl">Event label</span>
+    </div>
+    <div class="tl2-chips"><!-- badge chips --></div>
+    <div class="tl2-det"><!-- expanded detail, hidden by default --></div>
+  </div>
+</div>
+```
+
+**Dot color by event type:**
+- `--c-warn` (amber) — fraud ring probes, fraud device logins, AUTHN step_up_otp on suspicious devices
+- `--c-txn` (purple) — Penny-initiated email/phone change (entry point AND recovery revert)
+- `--c-info` (blue) — phone risk assessments (Neustar/Socure), STEP_UP challenges (OTP, IN_APP_CONFIRMATION), SCAN_ID checks
+- `--c-ato` (red) — fraud transactions (debit, transfers, P2P)
+- `--c-legit` (green) — victim device logins (low ML, home IP), ATO contact confirmed, dispute filings
+
+**Row-level highlight** — Penny entry-point rows and simultaneous challenge+fraud-txn rows get a background tint:
+```css
+style="background:color-mix(in srgb,var(--c-txn) 6%,transparent)"   /* Penny row */
+style="background:color-mix(in srgb,var(--c-ato) 5%,transparent)"   /* fraud device first login */
+style="background:color-mix(in srgb,var(--c-ato) 6%,transparent)"   /* challenge+txn simultaneous */
+```
+
+**Events to include** (populate from Query A, B, C, E-fraud, G, H, D data):
+
+| Event type | Source | Dot color | Key detail to show in `.tl2-det` |
+|---|---|---|---|
+| Fraud ring probe | Query A/E — step_up_otp on suspicious web device | warn | full device UUID, IP, Query I ring size and first_seen_global |
+| Phone risk assessment | Query H | info | UUID, carrier, VoIP flag, compromised indicator, policies fired |
+| STEP_UP challenge (pre-entry) | Query B | info | challenge type, USER_DECISION (or no decision), AUTHN outcome on nearest session |
+| Penny email/phone change | Query G — ORIGINATING_CLIENT=penny | txn | policies fired (allow_penny_updates), IP, UPDATE_CONTEXT, bypass explanation |
+| Fraud web probe (post-Penny) | Query A/E — step_up_otp, same IP as fraud device | warn | device UUID, IP, Query I linkage |
+| Fraud device first login | Query E-fraud — new device, AUTHN default | ato | full UUID, model, carrier, IP, city, all AUTHN events for this device (score progression), ATOM band vs. actual outcome |
+| SCAN_ID / eligibility blocks | Query G — document_upload or deny on fraud device | info | PII_TYPE, DECISION_OUTCOME, POLICY_NAME per row; note which PII types were blocked vs. allowed |
+| Fraud transaction | Query C per distinct TRANSACTION_TIMESTAMP | ato | claim ID, amount, payee, MCC, entry type, full filing history (all rounds with resolution code + date) |
+| Mid-fraud STEP_UP challenge | Query B — challenge between fraud txns | info | challenge type, USER_DECISION, transaction that followed despite the challenge |
+| Victim recovery login | Query A/E — victim device, home IP, low ML | legit | AUTHN score, device UUID, outcome |
+| Penny recovery revert | Query G — ORIGINATING_CLIENT=penny on victim side | txn | IP, timestamp, policies fired; note velocity counter NOT reset if applicable |
+| ATO contact confirmed | Query D | legit | ato_contact_date, ato_confirmed, new_dev_last_30d |
+
+**Key narrative to surface explicitly:**
+- If a Penny change preceded the fraud device login by < 15 minutes, mark it as **★ ENTRY POINT** and note "bypassed all self-serve velocity, SCAN_ID, and challenge controls via allow_penny_updates policy"
+- If a mid-fraud challenge (OTP or IN_APP_CONFIRMATION) fired with no USER_DECISION and a fraud transaction followed within 5 minutes, note "challenge did not stop the next transaction" in the `.tl2-det`
+- If a challenge and fraud transaction are within 60 seconds of each other, describe them as "simultaneous" and highlight with the ato background tint
+- If `first_seen_global` on a ring device is before its first appearance on this account, note "device was already active against another member before arriving at this victim"
 
 ### §3 — Device Matrix
 
