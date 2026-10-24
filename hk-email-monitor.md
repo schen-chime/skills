@@ -9,7 +9,7 @@ Read-only monitor for the ddw / Hong Kong email-change campaign. Each run covers
 
 ## Input
 
-None. Every run uses the latest 72 hours. The only setup is the campaign's known HK IP list (Step 1).
+None. Every run uses the latest 72 hours. Step 1 finds the campaign's HK IPs from the data, so there is nothing to set up.
 
 ## Requirements
 
@@ -19,9 +19,47 @@ None. Every run uses the latest 72 hours. The only setup is the campaign's known
 
 ---
 
-## Step 1 — Load the known HK IPs
+## Step 1 — Find the campaign's HK IPs
 
-Read `~/.claude/hk-email-monitor/known_ips.txt` (one IP per line; lines starting with `#` are comments). The list is shared privately inside the team and is not stored in this repo. If the file is missing or empty, ask the user to paste the list, then save it to that path. Check every line is a plain IPv4 or IPv6 address before using it.
+The campaign confirms its email changes from a few Hong Kong datacenter IPs, and almost every new email it sets is an outlook.com address. Run this query to list them. It looks at email-change confirmation clicks over the last 120 days and keeps IPs that geolocate to Hong Kong, are datacenter connections, confirmed email changes for 15 or more accounts, and set outlook.com on at least 80% of them. That last check keeps out other Hong Kong operations that don't use Outlook.
+
+Write it to a temp file (for example `/tmp/hk_ips.sql`) and run `snow sql -c env -f /tmp/hk_ips.sql --format json`:
+
+```sql
+use role SNOWFLAKE_PROD_ANALYST_OKTA; use warehouse ANALYTICS_WH;
+with clk as (
+  select try_to_number(u.user_id) user_id, u.original_timestamp ts, u.device_ip_address ip
+  from chime.decision_platform.user_service u
+  where u.original_timestamp >= dateadd('day', -120, current_timestamp()) and u.original_timestamp < current_timestamp()
+    and not u.is_shadow_mode and u.update_context = 'email_verification_email_change' and u.device_ip_address is not null
+),
+busy as (select ip, count(distinct user_id) accts, min(ts) first_seen, max(ts) last_seen from clk group by ip having count(distinct user_id) >= 15),
+geo as (
+  select connection_data_ip_address ip, mode(geo_ip_data_country) country, mode(connection_data_connection_type) ctype, mode(connection_data_isp) isp
+  from chime.decision_platform.device_intelligence
+  where original_timestamp >= dateadd('day', -120, current_timestamp()) and connection_data_ip_address in (select ip from busy)
+  group by 1
+),
+em as (   -- new email domain saved with each click (audit row within 10 seconds)
+  select c.ip, c.user_id, max(iff(split_part(lower(trim(v.change_to)), '@', -1) = 'outlook.com', 1, 0)) to_outlook
+  from clk c join busy b on b.ip = c.ip
+  join analytics.looker.versions_pivot v on v.item_id = c.user_id and v.item_type = 'User' and v.object = 'email'
+    and v.created_at between dateadd('second', -10, c.ts) and dateadd('second', 10, c.ts)
+  group by 1, 2
+)
+select b.ip, b.accts as accounts, g.isp, round(avg(e.to_outlook), 3) as outlook_share,
+       convert_timezone('America/Los_Angeles', b.first_seen)::date as first_seen_pt,
+       convert_timezone('America/Los_Angeles', b.last_seen)::date as last_seen_pt
+from busy b join geo g on g.ip = b.ip left join em e on e.ip = b.ip
+where g.country = 'HK' and g.ctype = 'Data Center'
+group by b.ip, b.accts, g.isp, b.first_seen, b.last_seen
+having avg(e.to_outlook) >= 0.8
+order by b.accts desc;
+```
+
+Show the user the IP list it returns (IP, accounts, provider, Outlook share, first and last seen). If it returns no rows, say so and stop: the campaign may have moved off Hong Kong datacenters.
+
+Optional: if `~/.claude/hk-email-monitor/known_ips.txt` exists (one IP per line; lines starting with `#` are comments), add its IPs to the list. Check every line is a plain IPv4 or IPv6 address first.
 
 Turn the list into a SQL values list: `('ip1'),('ip2'),...`
 
