@@ -483,10 +483,24 @@ group_metrics AS (
 -- Login volume uses the earliest observed production Android atom/member_logins
 -- row per real attempt, independent of success/allow. The 24h pre-window scan
 -- prevents normal boundary-crossing stages from becoming fresh chart attempts.
-login_rows AS (
+login_source_rows AS (
   SELECT * FROM authn_observation
   WHERE platform='android' AND event_name='atom_event' AND sub_event_name='member_logins'
     AND COALESCE(ml_inference_model,'')<>'atom_model'
+),
+-- A qualified attempt necessarily touches a selected eligible SDK device.
+-- Restrict expensive attempt/stage aggregation to those candidate IDs, then
+-- RESTORE ALL login-source rows for each ID, including other devices and owners.
+-- Filtering login rows directly by selected device would hide ambiguity.
+login_candidate_attempt_ids AS (
+  SELECT DISTINCT a.attempt_id
+  FROM login_source_rows a JOIN selected_devices d
+    ON d.device_id=a.device_id AND d.eligible
+  WHERE a.attempt_id IS NOT NULL AND UPPER(a.attempt_id)<>'NOT FOUND'
+),
+login_rows AS (
+  SELECT a.* FROM login_source_rows a
+  JOIN login_candidate_attempt_ids c USING(attempt_id)
 ),
 login_attempt_rollup AS (
   SELECT attempt_id,MIN(observed_at) attempt_at,
@@ -757,7 +771,9 @@ records AS (
     'volume_label','login attempts with signal, latest prior PI within 24h',
     'ownership_caveat','whole-window device and registration ambiguity exclusions may use ownership learned after an attempt; mapping_first_at must be <= attempt; these are reconstructed event-time signals, not point-in-time warehouse availability',
     'baseline_rule','all qualified attempts on deterministic bounded other-active-Android device sample; compare signal/evaluated-attempt rates, never raw baseline sample volume as population',
-    'missing_attempt_id_login_rows',(SELECT COUNT(*) FROM login_rows CROSS JOIN params z WHERE observed_at>=z.chart_start AND (attempt_id IS NULL OR UPPER(attempt_id)='NOT FOUND')),
+    'missing_attempt_id_login_rows',(SELECT COUNT(*) FROM login_source_rows CROSS JOIN params z WHERE observed_at>=z.chart_start AND (attempt_id IS NULL OR UPPER(attempt_id)='NOT FOUND')),
+    'attempt_rollup_scope','candidate IDs touching selected eligible SDK devices; every source login row for each ID retained for ambiguity and first-observed checks',
+    'excluded_ambiguous_identity_or_decision_attempts_scope','candidate attempt IDs only; not a global population diagnostic',
     'excluded_ambiguous_identity_or_decision_attempts',(SELECT COUNT(*) FROM login_attempt_rollup CROSS JOIN params z WHERE attempt_at>=z.chart_start AND (positive_users<>1 OR sdk_devices<>1 OR live_decisions<>1 OR invalid_owner_rows>0)),
     'lookup_status_counts',(SELECT ARRAY_AGG(OBJECT_CONSTRUCT_KEEP_NULL('cohort',cohort,'status',lookup_status,'attempts',n)) FROM (SELECT cohort,lookup_status,COUNT(*) n FROM login_attempt_signals GROUP BY 1,2)),
     'group_metrics',(SELECT ARRAY_AGG(OBJECT_CONSTRUCT_KEEP_NULL(
