@@ -1,114 +1,87 @@
 ---
 name: hk-trend-monitor
-description: Monitor the HK email-change campaign at a selected date and 24-hour time. Return the prior recorded campaign members, same-day proposed additions, 168 hourly volume buckets, reproducible IP results, infrastructure alerts, and Play Integrity/unlock risk trackers.
+description: Run the HK email monitor using the existing Hex dashboard logic at a selected date and 24-hour time. Return campaign lists, 168 hourly columns, IP results, and four hourly Google Play Integrity signal volumes on qualified campaign login attempts, with baseline comparison notes.
 ---
 
 # HK trend monitor
 
-Read-only investigation and reporting. Run when asked to check the HK trend, refresh campaign membership, examine HK/known-browser email changes, or compare app initiation with web completion. This skill does not schedule itself, send Slack messages, change account controls, or write campaign annotations.
+Use the published [HK Email Monitor](https://chime.hex.tech/global/app/HK-Email-Monitor-034ml6ptI5Uj50iMHuMDD0/latest) as the authority for the email-monitor logic. Add Play Integrity tracking for the whole monitored cohort even when there are zero new additions. Analysis is read-only; do not send messages, schedule runs, change controls, or annotate accounts.
 
-## Input and time contract
+## Input and execution
 
-Required: a date and 24-hour time, `YYYY-MM-DD HH:MM`. Default timezone: `America/Chicago`; honor an explicitly supplied IANA timezone or UTC offset. Example:
+Required input: `YYYY-MM-DD HH:MM` in 24-hour time. Default reporting timezone: `America/Chicago`; honor an explicit timezone or offset. T is the exclusive cutoff and D is local midnight of that date. Reject future/nonexistent times; ambiguous DST times need an explicit offset. The graph has exactly 168 elapsed-hour buckets in `[T−168h,T)`, including minute-aligned cutoffs.
 
-```text
-$hk-trend-monitor 2026-10-26 14:00 America/Chicago
-```
-
-The selected instant is **T, the exclusive as-of cutoff**, not the start of a future observation window. Let **D** be midnight at the start of the selected date in the reporting timezone.
-
-- **Current campaign list before the selected date:** members whose first recorded campaign annotation is before D.
-- **Users proposed for addition on the selected date:** qualifying observed email-change activity in `[D,T)`, excluding members annotated before D. Flag candidates already annotated during `[D,T)`; also return `recorded_today.csv` so they are not actioned twice.
-- **Hourly graph:** exactly 168 consecutive elapsed-hour buckets in `[T−168 hours,T)`, oldest to newest. A cutoff at 14:30 produces 168 full 60-minute buckets ending at 14:30. UTC arithmetic and local labels with offsets prevent DST duplicate/missing-hour errors. `hourly_168_columns.csv` has one metric-label column plus exactly 168 hour columns.
-- Events at T are excluded. Reject future cutoffs and nonexistent local times; require an explicit offset for an ambiguous DST time.
-
-The campaign history starts at `2026-07-01 00:00 UTC` by default, matching the existing HK monitor's searched campaign period. Set `--campaign-start` earlier when needed. It must cover the entire chart window and intended campaign history. Display the searched bounds; absence outside them is unknown.
-
-## Execute
-
-Use the existing official Snowflake CLI and configured `env` connection. Never call, enable, or start Snowflake MCP, alter connection/authentication configuration, or repeatedly retry authentication. The runner uses the existing read role and warehouse as session settings; override `--role`/`--warehouse` only when the caller's environment requires it. Empty values preserve the configured session settings.
-
-Use Python 3.9+ with standard library `zoneinfo` and installed timezone data. The package has no Python package-install step. From the installed skill directory, run:
+From the installed skill directory, run:
 
 ```bash
-python3 scripts/run_monitor.py --as-of "2026-10-26 14:00" --timezone America/Chicago --out-dir /tmp/hk-trend-20261026-1400
+python3 scripts/run_dashboard_monitor.py --as-of "2026-10-26 10:00" --timezone America/Chicago --out-dir /tmp/hk-trend-20261026-1000
 ```
 
-Resolve `scripts/` and `queries/` relative to this `SKILL.md`; use absolute paths when invoking from another directory. Choose a private writable output directory. Each run retains generated SQL, raw CLI JSON/error files, a cutoff/SQL-hash manifest, and derived results. No results are uploaded.
+Resolve resources relative to this file. Use a private writable output directory. Use the existing official Snowflake CLI `env` connection; never enable Snowflake MCP, alter authentication configuration, or retry failed authentication. Use the existing Hex CLI login to export the latest published project. If browser access is needed for dashboard edits, use the Hex skill and preserve the existing base queries.
 
-To give a teammate a runnable query, generate SQL without connecting:
+`--dashboard-export /private/path/dashboard.hex.yaml` uses an already exported private source instead of contacting Hex. `--prepare-only` writes teammate-runnable SQL without querying Snowflake. `--campaign-start` defaults to `2026-07-01` UTC and must cover the entire chart/history window. `--baseline-limit` defaults to 5,000 (validated range 1–10,000).
 
-```bash
-python3 scripts/run_monitor.py --as-of "2026-10-26 14:00" --timezone America/Chicago --out-dir /tmp/hk-trend-query --prepare-only
-snow sql -c env -f /tmp/hk-trend-query/main.sql --format JSON > /tmp/hk-trend-query/main.json
-python3 scripts/render_report.py --input /tmp/hk-trend-query/main.json --as-of "2026-10-26 14:00" --timezone America/Chicago --out-dir /tmp/hk-trend-query
-```
+The runner records dashboard project/version IDs, SQL/export hashes, bounds and query artifacts. The [dashboard adapter](scripts/dashboard_adapter.py) validates the reviewed source-cell identities and fingerprints; changed filters or flow logic require review rather than silently falling back to the old monitor. Runtime known-IP values are read from the dashboard and never stored in public skill code.
 
-The main query returns the actual IP list as `RECORD_TYPE='IP'` rows. The renderer writes `ips.csv`; **show that query result**, including IP, country, provider, attempts, allows, persisted successes, account count, Outlook numerator/share, first/last observation, and qualification timestamp. Export the first-threshold `qualification_accounts`, `qualification_outlook_accounts`, and `qualification_outlook_share` separately from the all-history IP aggregates. An empty IP result is a valid finding, not a reason to skip the remaining trackers. A main-only teammate run explicitly lacks the risk query; use the full runner for Play Integrity/unlock results.
+## Dashboard definitions
 
-### Resources
+Preserve these rules when adapting the cutoff and display timezone:
 
-- [Runner](scripts/run_monitor.py): validates input, prepares parameters, calls `snow`, runs the lower-priority risk query for proposed additions, and renders results.
-- [Main SQL](queries/monitor.sql): campaign registry, dynamic IP discovery, hourly metrics, candidate additions, and infrastructure alerts.
-- [Play Integrity SQL](queries/play_integrity.sql): same-device/registration PI signals, actual unlock events, and missing-source diagnostics.
-- [Renderer](scripts/render_report.py): standalone interactive HTML, full CSV lists, 168-column export, and strict majority alerts.
+- HK: non-shadow USER_SERVICE email-confirmation rows whose modal GeoIP is HK **or** whose IP is in the dashboard's configured known list. Attempts retain the dashboard's row grain.
+- Known browsers: any browser seen confirming from a configured known IP since July 1 through T. This is the dashboard's whole-window retrospective browser set; do not substitute annotation-gated or frozen-before-day membership.
+- App → web: live risk-decision-log records (`evaluation_target='general'`), first web confirmation per member/requested email in the source window, with an app request for that same email/member in the preceding 35 minutes. Never return requested email addresses.
+- **Dashboard success means policy allowed.** Label it “Dashboard success (policy allowed)”; it does not prove a persisted email change. Do not mix these counts with the previous audit-linked completion metric.
+- Preserve the dashboard's 60-day and 14-day source horizons and modal geography windows, while exporting exactly the selected 168 hours. Modal geography and whole-window browser membership are retrospective definitions, not point-in-time knowledge.
 
-## Definitions that must stay distinct
+The previous standalone `run_monitor.py` / `queries/monitor.sql` implement different audit-persistence/discovery rules and are retained as legacy resources. They are not the default for this skill.
 
-| Output | Definition and limitation |
-|---|---|
-| Attempt | One production email-verification-link decision, deduplicated by member and non-null decision ID, with a composite fallback. Policy rows are not separate attempts; a shared request ID is not a cross-member deduplication key. |
-| Allowed | An unconflicted observed `allow` outcome. Keep it separate from persisted success. |
-| Success | A real email audit transition uniquely associated with a click in both directions within ±10 seconds. This is strong user/time correlation, not an exact workflow-key join. Ambiguous/unmatched audit pairs stay unknown, not successful. |
-| HK email updates | Web confirmation context `email_verification_email_change` whose preceding IP GeoIP observation reports `HK`. Device timezone alone never establishes country. A known campaign IP without current geo coverage is not automatically HK. |
-| Known-bad-device tracker | Campaign-linked browser IDs supported by persisted HK/datacenter/Outlook activity on an annotated campaign member. Freeze qualification before D and require the indicator's evidence timestamp no later than each counted event. These are reported browser identifiers, not attested hardware/person identities. |
-| App → web | Web click with the latest same-user app `in_app_email_verification_check` in the preceding 30 minutes. Count each click once and preserve candidate multiplicity. It is a temporal association unless a common workflow key is independently verified. This path is normal for many members and alone does not add them to the campaign. |
-| Current campaign member | Recorded Penny annotation on a user resource matching the existing campaign marker. Do not return note content. The first annotation time is not compromise time. Current note text may have been edited; no historical warehouse/annotation-version availability is asserted. |
-| Proposed addition | Persisted activity on a pre-day campaign-linked device; persisted Outlook change on a pre-day campaign IP; or persisted Outlook change from newly qualified HK/datacenter infrastructure. These are review candidates, not confirmed ATOs or automatic annotation writes. |
+## Campaign and IP outputs
 
-Never silently substitute policy allows for successes. Do not filter out real consumer web confirmations because `DEVICE_PLATFORM` is `invalid`; the producer context identifies this flow. The three hourly streams overlap and should not be summed as unique total events.
+Return full CSVs, without row caps:
 
-## Infrastructure discovery and alert evidence
+1. `prior_users.csv`: recorded Penny user-resource campaign annotations before D.
+2. `new_users.csv`: allowed selected-day confirmations on dashboard known IPs/browsers, excluding pre-day recorded members. These are review proposals; preserve same-day annotation flags and `recorded_today.csv`. `all_users.csv` keeps recorded/proposed membership distinct.
+3. `report.html`, `hourly.csv` (168 rows), and `hourly_168_columns.csv` (168 hour columns plus metric label).
+4. The **actual IP query result** in `ips.csv`, including IP, country/provider, attempts/allows, accounts and first/last observations. Unsupported persistence/Outlook fields stay unknown. Include `main.sql` so teammates can reproduce the list with their own authorized connection.
+5. New campaign IP/country observations relative to the searched pre-day history, plus factual volume comparisons with explicit periods. Geography may reflect legitimate recovery/member activity; it does not identify an actor.
 
-The reproducible discovery rule requires at least **15 distinct confirmation users** and an **80% Outlook share** for HK/datacenter event observations. The denominator includes all observed users, including those without uniquely attributable persisted Outlook changes, so the share is conservative. Qualification occurs only when cumulative evidence crosses the threshold; later evidence cannot backdate an indicator. This is a discovery heuristic, not a fraud verdict.
+The PI cohort is the union of recorded campaign members and users with allowed dashboard-linked confirmations since the searched history start. Keep this operational membership separate from adjudicated ATO labels. Source annotation edit/ingestion history is not asserted.
 
-Return campaign-linked IPs and candidate IPs separately through their evidence fields. GeoIP uses the latest same-IP observation at or before each event, no older than 45 days; same-time conflicts, staleness and missing countries remain unknown. Avoid a full-window modal country that would use future observations for earlier events.
+## Google Play Integrity tracking
 
-Report:
+Run [cohort_play_integrity.sql](queries/cohort_play_integrity.sql) for the full cohort independently of additions. The primary PI output is **four hourly campaign login-attempt volume graphs**, each with exactly 168 elapsed-hour buckets:
 
-- New IPs or countries first seen in the selected-day campaign activity, including activity on existing campaign users or known browsers outside HK. Explain whether the observation could be recovery/legitimate activity; geography does not identify an actor.
-- Newly threshold-qualified HK/datacenter IPs and their evidence counts; do not silently declare them confirmed bad infrastructure.
-- Missing/stale/conflicting GeoIP, ambiguous audit matches, conflicting decision attributes, and multiple potential app initiations.
-- Material hourly spikes/drops visible in the 168-hour graph, with explicit comparison periods and denominators. Do not invent a production alert threshold or call an empty/inaccessible source zero activity.
+1. UNKNOWN_CONTROLLING: non-Play/other-profile controlling.
+2. KNOWN_CONTROLLING: Play/system-known controlling.
+3. Known-only controlling: KNOWN present and UNKNOWN absent.
+4. Any controlling: either signal.
 
-## Play Integrity and unlock risk tracker
+A qualified login is a production Android AUTHN `atom_event` / `member_logins` attempt, with a real `ACCOUNT_ACCESS_ATTEMPT_ID`, one positive member, one SDK device and one live decision. Exclude `atom_model` inference-only rows, deduplicate policy/stage rows by attempt ID, and anchor at the earliest live evaluation. Count attempts irrespective of allow/success. The first login row must carry the member and SDK device. The four signals overlap; never sum their totals.
 
-Include this lower-priority tracker by default for the proposed additions. It does not create campaign membership. Read the query's mapping comments before changing signal classification.
+For each attempt use the latest valid HTTP-2xx/object PI callback on its **exact registration/member/SDK device**, observed at or before login and no more than **24 hours old**. The attempt registration must already be present at its first evaluation, and mapping evidence must exist by login. A missing/ambiguous registration stays unknown. Scan PI and mapping evidence 24 hours before the chart start to avoid losing early-window observations. Later callbacks and later-only registrations cannot qualify an earlier login. This is a recent PI-state association, not verified attestation-request binding or proof the login itself generated the callback.
 
-- Join production AUTHN's exact member/device/registration evidence to `VENDOR_PLAY_INTEGRITY` callbacks. Preserve anonymous vendor user 0 through the validated registration association; quarantine shared/conflicting registrations, conflicting callback variants, and failed/unparseable callbacks.
-- Show six nullable standardized signals: controlling, capturing, overlays, harmful Play Protect verdict, unrecognized app, and device integrity below this monitor's documented threshold. Report raw verdicts as metadata. `INSTALLED` alone and absence of optional strong-integrity attestation are not risk triggers. Empty/unevaluated fields remain unknown.
-- Use actual `ACCESS_TYPE_UNLOCKED` events. A device's biometry/security capability does not establish the method used for an unlock. Link only same-user/same-verified-device PI before the unlock, with a seven-day freshness bound. The current direct-string namespace association is **provisional**; it is visible but excluded from confirmed unlock-linked majority alerts until a source bridge is validated.
-- Standard PI risks remain reportable independently of unlock linkage. Label the observation scope and time relative to the campaign activity; an earlier detection is not proof of malicious control during that activity. The query does not verify token request binding or historical ingestion availability.
-- **If a risky signal affects more than 50% of all newly proposed users, mention it prominently in the final output.** Use distinct users, not callbacks or unlock counts. Show `triggered / all additions`, telemetry coverage, observed-only prevalence, and unknowns. Exactly 50% is not a majority. Missing telemetry never shrinks the all-additions denominator. Raw metadata and provisional associations cannot trigger this alert.
+Keep the latest unevaluated verdict unknown instead of substituting an older positive. Quarantine conflicting same-time verdicts, stable-ID variants and observed ownership conflicts. Exact enum positives remain usable with future enum values; negative classification requires a nonempty fully recognized array. Missing, malformed, unmapped and stale telemetry stays unknown. Zero positive volume is distinct from zero telemetry coverage.
 
-Signal semantics: [Android integrity verdicts](https://developer.android.com/google/play/integrity/verdicts) and [app access risk remediation](https://developer.android.com/google/play/integrity/remediation). These describe risk capabilities, not proof of ATO, malware, or member consent.
+Use the existing unique ownership/device safeguards and Android app-open registration bridge. Whole-window device/registration ownership checks can conservatively exclude attempts using later conflict evidence; label that retrospective exclusion. They cannot create a positive from future PI or mapping evidence. Operational campaign membership is also retrospective and is not an adjudicated ATO label.
 
-## Deliverables and failure handling
+For comparison use the same-window deterministic bounded sample of other active Android devices, excluding campaign owners. Count their qualified login attempts using the identical attempt and PI rules. **Baseline belongs in notes, not the volume graph series.** If a signal's campaign positive/evaluated-attempt rate exceeds baseline, report counts, rates, denominators and coverage as a descriptive note, not a significance or causal claim. Do not compare raw campaign/baseline volumes across differently sized populations.
 
-Return the cutoff/timezone and source bounds, followed by:
+Export `login_pi_hourly.csv`, `login_pi_summary.json`, and four volume graphs in `report.html`. Validate 1,344 cohort/hour/signal rows, unique keys, triggered≤evaluated≤qualified, unknown=qualified−evaluated, and group/overall coverage totals before plotting. Missing extraction or buckets produce visible gaps/unavailable status. Device-snapshot CSVs and the cohort prevalence section remain secondary diagnostics, not a substitute for login-attempt volume. The separate strictly-more-than-50%-of-all-new-users alert and unlock tracker still apply to additions.
 
-1. The current user-ID list before the selected date (`prior_users.csv`) and count.
-2. Proposed new user IDs for the selected day up to T (`new_users.csv`), evidence reasons, and same-day annotations (`recorded_today.csv`). The union (`all_users.csv`) labels recorded versus proposed membership.
-3. An interactive histogram with exactly 168 columns and selectable HK / known-device / app-to-web streams and attempts / persisted successes / allowed views. Include both `hourly.csv` and `hourly_168_columns.csv`.
-4. The actual IP query results (`ips.csv`) and all infrastructure/country/volume alerts with dates and evidence.
-5. Play Integrity and unlock tracker results, highlighting any majority risky signal, with coverage and limitations. Include `risk_signals.csv`, telemetry coverage, `summary.json`, `summary.md`, and `report.html`.
+### Historical context to retain separately
 
-User-ID and infrastructure lists stay in private local run artifacts. Public skill/PR contents contain queries and synthetic tests, not production result lists, IP/device seed lists, notes, or contact PII. Do not send a Slack draft/message or schedule recurring runs merely because the skill is named a monitor.
+The original investigation found UNKNOWN_CONTROLLING on **145/908 = 16.0%**, versus **39/4,165 = 0.9%** in sampled other Android phone changers (about 17×). Its grain was one selected phone-change request per member, using the latest prior AUTHN-mapped verdict with environment details, without a freshness cap; original populations were 1,259 and 5,893, with median verdict ages 16 and 3 days. These are fixed historical measurements, not current live rates or the same device-snapshot method.
 
-On main-query/authentication/network failure, preserve the error and stop without repeated sign-in attempts. On a lower-priority PI query failure, preserve the primary report and mark risk telemetry unavailable/partial. If the campaign registry is inaccessible, do not fabricate an empty current list: a separately authorized rerun may use a supplied private registry snapshot, or a typed empty registry CTE **with** `current_registry_available=false`; candidate differences remain provisional. No row caps are permitted on exported member/IP lists.
+Known-only controlling showed little difference: **61/908 = 6.7% versus 283/4,165 = 6.8%**. Those known-only figures exclude verdicts also containing UNKNOWN; do not relabel them as all KNOWN_CONTROLLING.
 
-Validate actual run counts, the prior/new split, the 168-hour grid, and the success/attempt invariant before delivery. Keep recorded annotations, candidate signals, prior ATO contact labels, and adjudicated fraud separate. A historical run is an event-time reconstruction unless source availability/version history independently proves point-in-time knowledge.
+UNKNOWN_CONTROLLING was observed **around takeover in 9/9 selected end-to-end reviews**. This was not a random sample or nine positive pre-action checks: four first-positive observations followed the change amid observation gaps. Keep this selected-case evidence separate from population prevalence and live alert denominators.
 
-## Package checks
+A Play Store app acting as a lure/downloader for a separate controller is a hypothesis. PI does not identify the app, prove malware/ATO, or establish who controlled the phone. KNOWN includes system-preloaded apps, and apps in another device profile may receive UNKNOWN regardless of install source. See [Google's verdict definitions](https://developer.android.com/google/play/integrity/verdicts).
 
-Run `python3 -m unittest discover -s tests -v` from this skill directory. The tests use synthetic data and never invoke Snowflake. `tests/pi_truth_table.sql` is an optional read-only VALUES query for verifying nullable integrity semantics through an existing Snowflake session; it reads no production tables.
+## Validation and failures
+
+Validate source provenance, prior/new disjointness, 168 buckets, allow≤attempt invariants, unique-device aggregation and per-signal denominators before delivery. Report missing data and searched bounds. A completed extraction does not prove source ingestion freshness.
+
+Stop on primary Hex/Snowflake access/authentication failure, preserving errors. If lower-priority cohort/new-user telemetry fails, retain primary outputs and show unavailable/partial risk coverage; do not repeat sign-in or return a clean verdict. Keep historical context visible without substituting it for live measurements.
+
+Public skill/PR contents contain implementation and synthetic tests, not production result lists, IP/device seeds, note content or contact PII. Local exports/results remain private. Run `python3 -m unittest discover -s tests -v` from the installed package for offline checks.

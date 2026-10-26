@@ -416,7 +416,8 @@ TELEMETRY_COUNT_FIELDS = (
     "authn_registrations", "authn_devices", "usable_registrations", "ambiguous_registrations",
     "mapped_vendor_callbacks", "unmapped_vendor_callbacks", "http_error_or_unknown_callbacks",
     "invalid_json_callbacks", "missing_token_payload_callbacks", "vendor_user_conflict_callbacks",
-    "callbacks_with_stable_id_variants", "valid_pi_callbacks", "apps_detected_array_callbacks",
+    "callbacks_with_stable_id_variants", "valid_pi_callbacks", "apps_detected_array_callbacks", "app_access_fully_evaluated_callbacks",
+    "app_access_known_positive_callbacks", "app_access_partly_unknown_callbacks", "app_access_unknown_callbacks",
     "device_verdict_array_callbacks", "pi_devices", "unlock_events", "android_unlock_events",
     "direct_device_prior_pi_unlocks", "unlocks_without_mapped_prior_pi", "confirmed_unlock_pi_links",
     "provisional_unlock_pi_links",
@@ -703,7 +704,7 @@ function render(){{
  data.hourly.forEach((row,i)=>{{const value=values[i],h=value===null?3:(value/peak)*200;
  const rect=node("rect",{{x:left+i*step+1,y:bottom-h,width:Math.max(1,step-2),height:h,fill:value===null?"#aebbc9":"#1768ac","data-hour":i}});
  rect.append(node("title",{{}},`${{row.hour_local}} | ${{key}}: ${{value===null?"UNKNOWN":value}}`));svg.append(rect);
- if(i%(width<2000?24:12)===0||i===167)svg.append(node("text",{{x:left+i*step+4,y:bottom+14,transform:`rotate(35 ${{left+i*step+4}} ${{bottom+14}})`,"font-size":10,fill:"#50647c"}},row.hour_local));
+ if(i%(width<2000?24:12)===0||i===167)svg.append(node("text",{{x:left+i*step+4,y:bottom+14,transform:i===167?"":`rotate(35 ${{left+i*step+4}} ${{bottom+14}})`,"text-anchor":i===167?"end":"start","font-size":10,fill:"#50647c"}},row.hour_local.slice(5).replace("T"," ")));
  }});
  const unknown=168-known.length,total=known.reduce((a,b)=>a+b,0);
  document.getElementById("chart-note").textContent=`${{data.streams[stream]}} · ${{metric}} · ${{total}} in observed bins · ${{unknown}}/168 unknown hours. Hover over a column for its exact hour and value.`;
