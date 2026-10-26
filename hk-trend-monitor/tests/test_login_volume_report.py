@@ -59,6 +59,17 @@ class LoginVolumeTests(unittest.TestCase):
         self.assertIn('overlap', summary['overlap'])
         self.assertIn('at or before', summary['method'])
 
+    def test_rfc_snowflake_timestamps(self):
+        from email.utils import format_datetime
+        data = fixture()
+        for item in data:
+            for field in ('cutoff', 'window_start', 'hour_start', 'hour_end'):
+                if field in item['PAYLOAD']:
+                    item['PAYLOAD'][field] = format_datetime(datetime.fromisoformat(item['PAYLOAD'][field]))
+        summary = summarize_login_volume(data, format_datetime(CUTOFF))
+        self.assertEqual(summary['status'], 'AVAILABLE')
+        self.assertEqual(metric(summary)['triggered_attempts'], 4)
+
     def test_nested_cli_and_serialized_payloads(self):
         data = fixture()
         wrapped = {'statements': [{'data': [{'record_type': row['RECORD_TYPE'], 'payload': json.dumps(row['PAYLOAD'])} for row in data]}]}

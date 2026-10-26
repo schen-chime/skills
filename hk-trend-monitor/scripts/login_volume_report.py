@@ -11,6 +11,7 @@ import html
 import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -41,8 +42,11 @@ def _time(value, field='timestamp'):
     elif isinstance(value, str):
         try:
             result = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        except ValueError as exc:
-            raise ValueError(f'Invalid {field}: {value!r}') from exc
+        except ValueError:
+            try:
+                result = parsedate_to_datetime(value)
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f'Invalid {field}: {value!r}') from exc
     else:
         raise ValueError(f'{field} must be an ISO timestamp')
     return (result.replace(tzinfo=UTC) if result.tzinfo is None else result).astimezone(UTC)
