@@ -1,6 +1,6 @@
 ---
 name: hk-trend-monitor
-description: Use the existing Hex HK Email Monitor logic at a selected date and 24-hour time, with campaign lists, 168 hourly buckets, IP results and full-cohort Google Play Integrity tracking.
+description: Use the existing Hex HK Email Monitor logic at a selected date and 24-hour time, with campaign lists, 168 hourly buckets, IP results and four hourly Google Play Integrity signal volumes on qualified campaign login attempts.
 ---
 
 # HK trend monitor
@@ -25,7 +25,7 @@ The selected instant **T** is an exclusive cutoff; **D** is midnight at the star
 2. Users proposed for addition during `[D,T)`, evidence reasons, and flags for users already annotated that day. Recorded and proposed membership remain separate.
 3. An interactive histogram with exactly **168 hourly columns** and CSV exports for HK, known campaign device IDs, and app-initiated/web-completed email updates. Each stream uses the published dashboard definitions: successes are policy allows, explicitly labelled; persistence is not inferred.
 4. The actual query-generated IP list with country, provider, attempts/allows, account counts and observation times; alerts for new IPs/countries relative to the searched pre-day campaign history. Persistence and Outlook-share fields unsupported by the dashboard remain unknown.
-5. Ongoing Play Integrity device tracking for the entire cohort, including zero-addition days: separate non-Play and Play/system-known controlling signals, a sampled contemporary baseline, and per-signal coverage. Historical 16.0% versus 0.9% and 9/9 selected-case findings stay separate from live measurements. New-user and unlock risk trackers remain available for proposed additions. A risky signal affecting **more than 50% of all proposed additions** is highlighted. Raw metadata and provisional unlock/device associations cannot trigger a confirmed majority alert.
+5. Four hourly Play Integrity trigger-volume graphs for qualified campaign Android login attempts, including zero-addition days: UNKNOWN_CONTROLLING, KNOWN_CONTROLLING, known-only and any controlling. Match the latest same-registration/member/device PI observation available before login within 24 hours; missing telemetry remains unknown. Show baseline rate elevations as descriptive notes with denominators and coverage. Historical 16.0% versus 0.9% and 9/9 selected-case findings stay separate from live measurements. New-user and unlock risk trackers remain available for proposed additions. A risky signal affecting **more than 50% of all proposed additions** is highlighted. Raw metadata and provisional unlock/device associations cannot trigger a confirmed majority alert.
 
 ## Run
 
@@ -35,7 +35,7 @@ Requires Python 3.9+ and the existing official Snowflake CLI connection. From th
 python3 hk-trend-monitor/scripts/run_dashboard_monitor.py --as-of "2026-10-26 14:00" --timezone America/Chicago --out-dir /tmp/hk-trend-20261026-1400
 ```
 
-Use `--prepare-only` to create a teammate-runnable `main.sql` without querying. It returns the actual IP list as `RECORD_TYPE='IP'` rows. The full runner additionally executes the full-cohort Play Integrity/baseline query, and new-user/unlock tracking when additions exist and writes standalone HTML plus full CSV/JSON results.
+Use `--prepare-only` to create a teammate-runnable `main.sql` without querying. It returns the actual IP list as `RECORD_TYPE='IP'` rows. The full runner additionally executes the full-cohort Play Integrity/baseline query and writes four qualified-login volume graphs, and new-user/unlock tracking when additions exist and writes standalone HTML plus full CSV/JSON results.
 
 Read [the canonical skill](hk-trend-monitor/SKILL.md) for membership/discovery rules, source limits, exact success/app-to-web definitions, risk mappings, error handling, and tests. Queries reconstruct event-time history; historical source availability and annotation edit history are not asserted. Proposed additions require review and do not modify the campaign.
 

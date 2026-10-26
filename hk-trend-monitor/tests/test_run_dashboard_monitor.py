@@ -18,6 +18,8 @@ LEGACY_DIR = SCRIPT_DIR.parent / "package/scripts"
 if LEGACY_DIR.is_dir():
     sys.path.insert(0, str(LEGACY_DIR))
 
+from datetime import datetime
+from test_login_volume_report import fixture as login_fixture
 import run_dashboard_monitor as monitor
 
 
@@ -54,7 +56,7 @@ def cohort():
                 "known_controlling_evaluated_devices": 1, "known_controlling_positive_devices": 0,
                 "known_only_controlling_evaluated_devices": 1, "known_only_controlling_positive_devices": 0,
                 "any_controlling_evaluated_devices": 1, "any_controlling_positive_devices": 1}]}),
-            record("COHORT_DEVICE", {"device_id": "device-42", "user_id": "42", "cohort": "campaign", "eligible": True, "unknown_controlling": True, "known_controlling": False, "valid_callbacks": 1, "latest_observed_at": "2026-10-21T14:00:00Z", "app_access_evaluated": True})]
+            record("COHORT_DEVICE", {"device_id": "device-42", "user_id": "42", "cohort": "campaign", "eligible": True, "unknown_controlling": True, "known_controlling": False, "valid_callbacks": 1, "latest_observed_at": "2026-10-21T14:00:00Z", "app_access_evaluated": True})] + login_fixture(cutoff=datetime.fromisoformat(CUTOFF.replace("Z","+00:00")))
 
 
 def risk(new_ids):

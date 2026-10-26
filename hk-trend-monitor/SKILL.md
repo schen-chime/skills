@@ -1,6 +1,6 @@
 ---
 name: hk-trend-monitor
-description: Run the HK email monitor using the existing Hex dashboard logic at a selected date and 24-hour time. Return campaign lists, 168 hourly columns, IP results, and ongoing Google Play Integrity cohort/baseline tracking with separate non-Play and Play-known controlling signals.
+description: Run the HK email monitor using the existing Hex dashboard logic at a selected date and 24-hour time. Return campaign lists, 168 hourly columns, IP results, and four hourly Google Play Integrity signal volumes on qualified campaign login attempts, with baseline comparison notes.
 ---
 
 # HK trend monitor
@@ -49,22 +49,24 @@ The PI cohort is the union of recorded campaign members and users with allowed d
 
 ## Google Play Integrity tracking
 
-Run [cohort_play_integrity.sql](queries/cohort_play_integrity.sql) for the full cohort, independently of additions. Use a common `[T−7d,T)` window for campaign and baseline; never use old annotation dates as PI scan anchors.
+Run [cohort_play_integrity.sql](queries/cohort_play_integrity.sql) for the full cohort independently of additions. The primary PI output is **four hourly campaign login-attempt volume graphs**, each with exactly 168 elapsed-hour buckets:
 
-The live metric is a **latest-callback snapshot of active Android SDK devices**, one validated device per row. Eligibility comes from production Android AUTHN activity. Include the verified Android app-open registration-status bridge, exact member/device/registration ownership, HTTP/JSON checks, anonymous-owner diagnostics, callback variants and latest-timestamp tie quarantine. Shared/ambiguous devices are excluded with counts and reasons. No cross-device/user-time-only PI join is sufficient.
+1. UNKNOWN_CONTROLLING: non-Play/other-profile controlling.
+2. KNOWN_CONTROLLING: Play/system-known controlling.
+3. Known-only controlling: KNOWN present and UNKNOWN absent.
+4. Any controlling: either signal.
 
-Baseline: deterministic bounded sample of other active Android devices in the same window, excluding any observed cohort owner. Report its full eligible population, sample size and selection method. It is a comparison population, not verified legitimate traffic.
+A qualified login is a production Android AUTHN `atom_event` / `member_logins` attempt, with a real `ACCOUNT_ACCESS_ATTEMPT_ID`, one positive member, one SDK device and one live decision. Exclude `atom_model` inference-only rows, deduplicate policy/stage rows by attempt ID, and anchor at the earliest live evaluation. Count attempts irrespective of allow/success. The first login row must carry the member and SDK device. The four signals overlap; never sum their totals.
 
-Track separately:
+For each attempt use the latest valid HTTP-2xx/object PI callback on its **exact registration/member/SDK device**, observed at or before login and no more than **24 hours old**. The attempt registration must already be present at its first evaluation, and mapping evidence must exist by login. A missing/ambiguous registration stays unknown. Scan PI and mapping evidence 24 hours before the chart start to avoid losing early-window observations. Later callbacks and later-only registrations cannot qualify an earlier login. This is a recent PI-state association, not verified attestation-request binding or proof the login itself generated the callback.
 
-- `UNKNOWN_CONTROLLING`: non-Play/other-profile controlling signal.
-- `KNOWN_CONTROLLING`: Play/system-known controlling signal.
-- Known-only: KNOWN present and UNKNOWN absent on the same selected verdict.
-- Any controlling: either signal, as an optional rollup.
+Keep the latest unevaluated verdict unknown instead of substituting an older positive. Quarantine conflicting same-time verdicts, stable-ID variants and observed ownership conflicts. Exact enum positives remain usable with future enum values; negative classification requires a nonempty fully recognized array. Missing, malformed, unmapped and stale telemetry stays unknown. Zero positive volume is distinct from zero telemetry coverage.
 
-Show positive/all eligible devices, positive/evaluated devices, per-signal coverage, unknown devices, latest verdict age, first/last positive observations and exclusions. Missing, empty, malformed, unevaluated or conflicting telemetry remains unknown. A recognized positive can remain true alongside a future enum while other negatives remain unknown. Do not inflate prevalence by counting callbacks or taking any positive across the window as the latest state.
+Use the existing unique ownership/device safeguards and Android app-open registration bridge. Whole-window device/registration ownership checks can conservatively exclude attempts using later conflict evidence; label that retrospective exclusion. They cannot create a positive from future PI or mapping evidence. Operational campaign membership is also retrospective and is not an adjudicated ATO label.
 
-Include `cohort_devices.csv`, `cohort_metrics.csv`, `cohort_summary.json`, and the cohort section in the interactive report. Explain differences from historical benchmarks. Cohort device prevalence is distinct from the existing **strictly more than 50% of all newly proposed users** alert: new-user risk telemetry still runs for additions, with separate controlling signals and provisional unlock associations excluded from majority alerts.
+For comparison use the same-window deterministic bounded sample of other active Android devices, excluding campaign owners. Count their qualified login attempts using the identical attempt and PI rules. **Baseline belongs in notes, not the volume graph series.** If a signal's campaign positive/evaluated-attempt rate exceeds baseline, report counts, rates, denominators and coverage as a descriptive note, not a significance or causal claim. Do not compare raw campaign/baseline volumes across differently sized populations.
+
+Export `login_pi_hourly.csv`, `login_pi_summary.json`, and four volume graphs in `report.html`. Validate 1,344 cohort/hour/signal rows, unique keys, triggered≤evaluated≤qualified, unknown=qualified−evaluated, and group/overall coverage totals before plotting. Missing extraction or buckets produce visible gaps/unavailable status. Device-snapshot CSVs and the cohort prevalence section remain secondary diagnostics, not a substitute for login-attempt volume. The separate strictly-more-than-50%-of-all-new-users alert and unlock tracker still apply to additions.
 
 ### Historical context to retain separately
 

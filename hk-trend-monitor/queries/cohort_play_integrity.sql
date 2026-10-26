@@ -1,9 +1,15 @@
--- READ ONLY: live active-Android device snapshot for a supplied campaign cohort.
+-- READ ONLY: live Android snapshot plus event-time qualified-login signal volume.
 -- This metric is independent of new additions and of the new-user majority rule.
 -- It differs from the historical latest-pre-phone-change 145/908 vs 39/4165 rate.
 --
 -- Required session variables: $chart_start = $cutoff minus 7 days; $cutoff.
--- Both activity eligibility and vendor observations use [chart_start, cutoff).
+-- Snapshot activity and selected-state callbacks use [chart_start, cutoff).
+-- Qualified login tracking additionally scans 24h before chart_start for prior PI,
+-- registration evidence, and bounded attempt-first-observed boundary deduplication.
+-- The 24h freshness cap is a monitoring choice, not a guarantee of current state.
+-- Snapshot flags are NEVER projected backward to classify historical attempts.
+-- Per-attempt lookup matches the exact registration plus SDK device and member;
+-- it is a prior observation association, not verified attestation request binding.
 -- Template substitutions (caller must validate before substitution):
 --   COHORT_USERS: a typed SELECT with one positive numeric user_id column.
 --     Empty: SELECT NULL::NUMBER user_id WHERE FALSE
@@ -21,7 +27,7 @@
 -- Anonymous AUTHN 0/NULL pre-login events do not conflict with one positive owner.
 -- This window cannot establish whether a device had another owner before it.
 --
--- Registrations are accepted only when all observed rows identify one exact
+-- Registrations use the eight-day evidence interval and are accepted only when all observed rows identify one exact
 -- (positive member, SDK device) pair. Anonymous status-stream owners (0/NULL)
 -- may inherit that device's unique AUTHN-backed owner; invalid owner strings do
 -- not. All visible owners of target registrations, including outside the cohort
@@ -56,7 +62,8 @@
 WITH
 params AS (
   SELECT $chart_start::TIMESTAMP_TZ chart_start, $cutoff::TIMESTAMP_TZ cutoff,
-    {{BASELINE_LIMIT}}::NUMBER(38,0) baseline_limit
+    DATEADD('hour',-24,$chart_start::TIMESTAMP_TZ) pi_start,
+    24::NUMBER pi_max_age_hours,{{BASELINE_LIMIT}}::NUMBER(38,0) baseline_limit
 ),
 cohort_input AS (
   {{COHORT_USERS}}
@@ -65,16 +72,25 @@ cohort_users AS (
   SELECT DISTINCT TRY_TO_NUMBER(user_id::STRING) user_id
   FROM cohort_input WHERE TRY_TO_NUMBER(user_id::STRING)>0
 ),
-authn_window AS (
+authn_observation AS (
   SELECT DISTINCT a.original_timestamp observed_at,
     TRY_TO_NUMBER(a.user_id::STRING) user_id,
     NULLIF(TRIM(a.user_id::STRING),'') raw_user_id,
     NULLIF(TRIM(a.device_id::STRING),'') device_id,
     NULLIF(TRIM(a.registration_id::STRING),'') registration_id,
-    LOWER(TRIM(a.platform::STRING)) platform
+    LOWER(TRIM(a.platform::STRING)) platform,
+    NULLIF(TRIM(a.account_access_attempt_id::STRING),'') attempt_id,
+    NULLIF(TRIM(a.decision_id::STRING),'') decision_id,
+    LOWER(TRIM(a.event_name::STRING)) event_name,
+    LOWER(TRIM(a.sub_event_name::STRING)) sub_event_name,
+    a.ml_inference_model::STRING ml_inference_model
   FROM chime.decision_platform.authn a CROSS JOIN params p
-  WHERE a.original_timestamp>=p.chart_start AND a.original_timestamp<p.cutoff
+  WHERE a.original_timestamp>=p.pi_start AND a.original_timestamp<p.cutoff
     AND a.is_shadow_mode=FALSE
+),
+authn_window AS (
+  SELECT DISTINCT observed_at,user_id,raw_user_id,device_id,registration_id,platform
+  FROM authn_observation CROSS JOIN params p WHERE observed_at>=p.chart_start
 ),
 active_android_devices AS (
   SELECT device_id,MIN(observed_at) first_active_at,MAX(observed_at) last_active_at,
@@ -82,7 +98,7 @@ active_android_devices AS (
   FROM authn_window WHERE platform='android' AND device_id IS NOT NULL
   GROUP BY 1
 ),
-status_window AS (
+status_observation AS (
   SELECT DISTINCT s._creation_timestamp observed_at,
     TRY_TO_NUMBER(s._user_id::STRING) user_id,
     NULLIF(TRIM(s._user_id::STRING),'') raw_user_id,
@@ -92,7 +108,11 @@ status_window AS (
     UPPER(TRIM(s.journey::STRING)) journey
   FROM streaming_platform.segment_and_hawker_production.device_events_v1_registration_status_updated s
   CROSS JOIN params p
-  WHERE s._creation_timestamp>=p.chart_start AND s._creation_timestamp<p.cutoff
+  WHERE s._creation_timestamp>=p.pi_start AND s._creation_timestamp<p.cutoff
+),
+status_window AS (
+  SELECT s.* FROM status_observation s CROSS JOIN params p
+  WHERE s.observed_at>=p.chart_start
 ),
 device_owner_evidence AS (
   SELECT a.device_id,a.user_id,a.raw_user_id,'authn' source,
@@ -156,11 +176,11 @@ selected_devices AS (
 ),
 device_registration_candidates AS (
   SELECT DISTINCT a.device_id,a.registration_id
-  FROM authn_window a JOIN selected_devices d USING(device_id)
+  FROM authn_observation a JOIN selected_devices d USING(device_id)
   WHERE d.eligible AND a.registration_id IS NOT NULL
   UNION
   SELECT DISTINCT s.device_id,s.registration_id
-  FROM status_window s JOIN selected_devices d USING(device_id)
+  FROM status_observation s JOIN selected_devices d USING(device_id)
   WHERE d.eligible AND s.registration_id IS NOT NULL AND s.platform='DEVICE_PLATFORM_ANDROID_APP'
 ),
 target_registrations AS (
@@ -169,13 +189,13 @@ target_registrations AS (
 registration_evidence AS (
   SELECT a.registration_id,a.device_id,a.user_id,a.raw_user_id,a.observed_at,
     'authn' source,TRUE source_can_map
-  FROM authn_window a JOIN target_registrations t USING(registration_id)
+  FROM authn_observation a JOIN target_registrations t USING(registration_id)
   UNION ALL
   SELECT s.registration_id,s.device_id,
     CASE WHEN s.raw_user_id IS NULL OR s.user_id=0 THEN d.user_id ELSE s.user_id END user_id,
     s.raw_user_id,s.observed_at,'registration_status' source,
     s.platform='DEVICE_PLATFORM_ANDROID_APP' source_can_map
-  FROM status_window s JOIN target_registrations t USING(registration_id)
+  FROM status_observation s JOIN target_registrations t USING(registration_id)
   LEFT JOIN device_state d ON d.device_id=s.device_id AND d.ownership_eligible
 ),
 registration_pairs AS (
@@ -217,7 +237,7 @@ vendor_target_stable_ids AS (
   FROM streaming_platform.segment_and_hawker_production.device_events_v1_vendor_response v
   CROSS JOIN params p
   WHERE v.name='VENDOR_PLAY_INTEGRITY'
-    AND v._creation_timestamp>=p.chart_start AND v._creation_timestamp<p.cutoff
+    AND v._creation_timestamp>=p.pi_start AND v._creation_timestamp<p.cutoff
     AND NULLIF(TRIM(v.registration_id::STRING),'') IN
       (SELECT registration_id FROM target_registrations)
     AND NULLIF(TRIM(v._message_id::STRING),'') IS NOT NULL
@@ -239,7 +259,7 @@ vendor_parsed AS (
   FROM streaming_platform.segment_and_hawker_production.device_events_v1_vendor_response v
   CROSS JOIN params p
   WHERE v.name='VENDOR_PLAY_INTEGRITY'
-    AND v._creation_timestamp>=p.chart_start AND v._creation_timestamp<p.cutoff
+    AND v._creation_timestamp>=p.pi_start AND v._creation_timestamp<p.cutoff
     AND (NULLIF(TRIM(v.registration_id::STRING),'') IN
       (SELECT registration_id FROM target_registrations)
       OR NULLIF(TRIM(v._message_id::STRING),'') IN
@@ -269,7 +289,7 @@ vendor_linked AS (
 pi_valid AS (
   SELECT * FROM vendor_linked
   WHERE http_success AND TYPEOF(token_payload)='OBJECT'
-    AND variant_count=1 AND NOT vendor_user_conflict
+    AND NOT vendor_user_conflict
 ),
 app_array_stats AS (
   SELECT v.callback_id,COUNT(*) app_access_items,
@@ -293,7 +313,7 @@ pi_app_evaluation AS (
       AND a.app_access_items>0 AND a.known_evaluated_items=a.app_access_items,FALSE) app_access_evaluated
   FROM pi_valid v LEFT JOIN app_array_stats a USING(callback_id)
 ),
-pi_signals AS (
+pi_signals_all AS (
   SELECT *,
     CASE WHEN unknown_controlling_items>0 THEN TRUE WHEN app_access_evaluated THEN FALSE
       ELSE NULL::BOOLEAN END unknown_controlling,
@@ -305,6 +325,10 @@ pi_signals AS (
     CASE WHEN unknown_controlling_items>0 OR known_controlling_items>0 THEN TRUE
       WHEN app_access_evaluated THEN FALSE ELSE NULL::BOOLEAN END any_controlling
   FROM pi_app_evaluation
+),
+pi_signals AS (
+  SELECT s.* FROM pi_signals_all s CROSS JOIN params p
+  WHERE s.variant_count=1 AND s.observed_at>=p.chart_start
 ),
 latest_valid_candidates AS (
   SELECT * FROM pi_signals
@@ -348,13 +372,15 @@ device_vendor_diagnostics AS (
   FROM device_registration_candidates c JOIN vendor_raw v USING(registration_id)
   JOIN vendor_variants x USING(stable_event_id)
   JOIN registration_cardinality k USING(registration_id)
+  CROSS JOIN params p WHERE v.observed_at>=p.chart_start
   GROUP BY 1
 ),
 linked_vendor_diagnostics AS (
   SELECT device_id,COALESCE(COUNT_IF(vendor_user_conflict),0) vendor_user_conflict_callbacks,
     COALESCE(COUNT_IF(raw_vendor_user_id IS NULL OR vendor_user_id=0),0) anonymous_vendor_callbacks,
     MAX(IFF(vendor_user_conflict,observed_at,NULL)) latest_vendor_user_conflict_at
-  FROM vendor_linked GROUP BY 1
+  FROM vendor_linked CROSS JOIN params p WHERE observed_at>=p.chart_start
+  GROUP BY 1
 ),
 blocking_observations AS (
   SELECT device_id,latest_variant_conflict_at observed_at,'conflicting_callback_variants' reason
@@ -454,6 +480,158 @@ group_metrics AS (
     COALESCE(COUNT_IF(eligible AND any_controlling),0) any_controlling_positive_devices
   FROM device_metrics GROUP BY 1
 ),
+-- Login volume uses the earliest observed production Android atom/member_logins
+-- row per real attempt, independent of success/allow. The 24h pre-window scan
+-- prevents normal boundary-crossing stages from becoming fresh chart attempts.
+login_rows AS (
+  SELECT * FROM authn_observation
+  WHERE platform='android' AND event_name='atom_event' AND sub_event_name='member_logins'
+    AND COALESCE(ml_inference_model,'')<>'atom_model'
+),
+login_attempt_rollup AS (
+  SELECT attempt_id,MIN(observed_at) attempt_at,
+    COUNT(DISTINCT IFF(user_id>0,user_id,NULL)) positive_users,
+    MIN(IFF(user_id>0,user_id,NULL)) user_id,
+    COUNT(DISTINCT device_id) sdk_devices,MIN(device_id) device_id,
+    COUNT(DISTINCT decision_id) live_decisions,MIN(decision_id) decision_id,
+    COUNT(DISTINCT registration_id) registrations,MIN(registration_id) registration_id,
+    COALESCE(COUNT_IF(raw_user_id IS NOT NULL AND COALESCE(user_id<>0,TRUE) AND
+      COALESCE(user_id<0,TRUE)),0) invalid_owner_rows
+  FROM login_rows WHERE attempt_id IS NOT NULL AND UPPER(attempt_id)<>'NOT FOUND'
+  GROUP BY 1
+),
+login_attempt_anchor AS (
+  SELECT r.attempt_id,COUNT(DISTINCT IFF(r.user_id>0,r.user_id,NULL)) anchor_users,
+    MIN(IFF(r.user_id>0,r.user_id,NULL)) anchor_user_id,
+    COUNT(DISTINCT r.device_id) anchor_devices,MIN(r.device_id) anchor_device_id,
+    COUNT(DISTINCT r.registration_id) anchor_registrations,MIN(r.registration_id) anchor_registration_id
+  FROM login_rows r JOIN login_attempt_rollup a ON a.attempt_id=r.attempt_id
+    AND a.attempt_at=r.observed_at
+  GROUP BY 1
+),
+qualified_login_attempts AS (
+  SELECT a.attempt_id,a.attempt_at,a.user_id,a.device_id,a.decision_id,
+    IFF(a.registrations=1 AND f.anchor_registrations=1
+      AND UPPER(f.anchor_registration_id)<>'NOT FOUND',f.anchor_registration_id,NULL) registration_id,
+    a.registrations,d.cohort
+  FROM login_attempt_rollup a JOIN login_attempt_anchor f USING(attempt_id)
+  JOIN selected_devices d
+    ON d.device_id=a.device_id AND d.user_id=a.user_id AND d.eligible
+  CROSS JOIN params p
+  WHERE a.attempt_at>=p.chart_start AND a.attempt_at<p.cutoff
+    AND a.positive_users=1 AND a.sdk_devices=1 AND a.live_decisions=1
+    AND f.anchor_users=1 AND f.anchor_user_id=a.user_id
+    AND f.anchor_devices=1 AND f.anchor_device_id=a.device_id
+    AND a.invalid_owner_rows=0 AND UPPER(a.device_id)<>'NOT FOUND'
+    AND UPPER(a.decision_id)<>'NOT FOUND'
+),
+-- Conflict time is the first time TWO variants of one stable callback ID are
+-- visible. Later variants never rewrite the prior signal on an earlier attempt.
+login_variant_conflict AS (
+  SELECT a.stable_event_id,MIN(GREATEST(a.observed_at,b.observed_at)) conflict_at
+  FROM vendor_raw a JOIN vendor_raw b ON a.stable_event_id=b.stable_event_id
+    AND a.callback_variant_hash<>b.callback_variant_hash
+  GROUP BY 1
+),
+login_prior_candidates AS (
+  SELECT q.*,v.observed_at pi_observed_at,v.callback_id,v.apps_detected,
+    v.unknown_controlling,v.known_controlling,v.known_only_controlling,v.any_controlling
+  FROM qualified_login_attempts q JOIN pi_signals_all v
+    ON v.device_id=q.device_id AND v.user_id=q.user_id
+    AND v.registration_id=q.registration_id AND v.observed_at<=q.attempt_at
+    AND v.mapping_first_at<=q.attempt_at
+  CROSS JOIN params p
+  WHERE v.observed_at>=DATEADD('hour',-p.pi_max_age_hours,q.attempt_at)
+  QUALIFY DENSE_RANK() OVER (PARTITION BY q.attempt_id ORDER BY v.observed_at DESC)=1
+),
+login_prior_selected AS (
+  SELECT *,COUNT(DISTINCT COALESCE(TO_JSON(apps_detected),'__MISSING_APP_ACCESS_ARRAY__'))
+    OVER(PARTITION BY attempt_id) same_time_verdict_variants
+  FROM login_prior_candidates
+  QUALIFY ROW_NUMBER() OVER(PARTITION BY attempt_id ORDER BY callback_id DESC)=1
+),
+-- Invalid HTTP/payload callbacks remain diagnostics and do not erase a valid
+-- prior observation. Owner/registration/variant conflict observations do.
+login_conflict_observations AS (
+  SELECT c.device_id,c.registration_id,GREATEST(v.observed_at,x.conflict_at) observed_at,
+    'conflicting_callback_variants' reason
+  FROM device_registration_candidates c JOIN vendor_raw v USING(registration_id)
+  JOIN login_variant_conflict x USING(stable_event_id)
+  UNION ALL
+  SELECT c.device_id,c.registration_id,v.observed_at,'ambiguous_registration_ownership'
+  FROM device_registration_candidates c JOIN vendor_raw v USING(registration_id)
+  JOIN registration_cardinality k USING(registration_id)
+  WHERE k.member_device_pairs>1 OR k.invalid_pair_rows>0
+  UNION ALL
+  SELECT device_id,registration_id,observed_at,'conflicting_vendor_member'
+  FROM vendor_linked WHERE vendor_user_conflict
+),
+login_prior_blockers AS (
+  SELECT q.attempt_id,MAX(b.observed_at) latest_blocking_at
+  FROM qualified_login_attempts q JOIN login_conflict_observations b
+    ON b.device_id=q.device_id AND b.registration_id=q.registration_id
+    AND b.observed_at<=q.attempt_at
+  GROUP BY 1
+),
+login_attempt_signals AS (
+  SELECT q.*,l.pi_observed_at,l.callback_id,
+    CASE WHEN q.registration_id IS NULL THEN 'missing_or_ambiguous_attempt_registration'
+      WHEN l.pi_observed_at IS NULL THEN 'no_valid_prior_callback_within_24h'
+      WHEN l.same_time_verdict_variants>1 THEN 'same_time_conflicting_valid_callbacks'
+      WHEN b.latest_blocking_at>=l.pi_observed_at THEN 'prior_conflicting_callback_or_owner'
+      ELSE 'prior_callback_selected' END lookup_status,
+    IFF(l.same_time_verdict_variants=1 AND COALESCE(b.latest_blocking_at<l.pi_observed_at,TRUE),
+      l.unknown_controlling,NULL)::BOOLEAN unknown_controlling,
+    IFF(l.same_time_verdict_variants=1 AND COALESCE(b.latest_blocking_at<l.pi_observed_at,TRUE),
+      l.known_controlling,NULL)::BOOLEAN known_controlling,
+    IFF(l.same_time_verdict_variants=1 AND COALESCE(b.latest_blocking_at<l.pi_observed_at,TRUE),
+      l.known_only_controlling,NULL)::BOOLEAN known_only_controlling,
+    IFF(l.same_time_verdict_variants=1 AND COALESCE(b.latest_blocking_at<l.pi_observed_at,TRUE),
+      l.any_controlling,NULL)::BOOLEAN any_controlling
+  FROM qualified_login_attempts q LEFT JOIN login_prior_selected l USING(attempt_id)
+  LEFT JOIN login_prior_blockers b USING(attempt_id)
+),
+login_signal_rows AS (
+  SELECT a.cohort,a.attempt_id,a.attempt_at,a.lookup_status,s.signal,
+    CASE s.signal WHEN 'unknown_controlling' THEN a.unknown_controlling
+      WHEN 'known_controlling' THEN a.known_controlling
+      WHEN 'known_only_controlling' THEN a.known_only_controlling
+      WHEN 'any_controlling' THEN a.any_controlling END signal_value
+  FROM login_attempt_signals a CROSS JOIN (
+    SELECT column1::STRING signal FROM VALUES ('unknown_controlling'),('known_controlling'),
+      ('known_only_controlling'),('any_controlling')) s
+),
+login_hour_actual AS (
+  SELECT cohort,signal,FLOOR(DATEDIFF('second',p.chart_start,a.attempt_at)/3600) hour_index,
+    COUNT(*) qualified_attempts,COUNT(signal_value) evaluated_attempts,
+    COALESCE(COUNT_IF(signal_value),0) triggered_attempts,
+    COALESCE(COUNT_IF(signal_value IS NULL),0) unknown_attempts
+  FROM login_signal_rows a CROSS JOIN params p GROUP BY 1,2,3
+),
+login_hour_spine AS (
+  SELECT ROW_NUMBER() OVER (ORDER BY SEQ4())-1 hour_index
+  FROM TABLE(GENERATOR(ROWCOUNT=>168))
+),
+login_hourly AS (
+  SELECT c.cohort,s.signal,h.hour_index,
+    DATEADD('hour',h.hour_index,p.chart_start) hour_start,
+    DATEADD('hour',h.hour_index+1,p.chart_start) hour_end,
+    COALESCE(a.qualified_attempts,0) qualified_attempts,
+    COALESCE(a.evaluated_attempts,0) evaluated_attempts,
+    COALESCE(a.triggered_attempts,0) triggered_attempts,
+    COALESCE(a.unknown_attempts,0) unknown_attempts
+  FROM login_hour_spine h CROSS JOIN params p
+  CROSS JOIN (SELECT column1::STRING cohort FROM VALUES ('campaign'),('baseline')) c
+  CROSS JOIN (SELECT column1::STRING signal FROM VALUES ('unknown_controlling'),('known_controlling'),
+    ('known_only_controlling'),('any_controlling')) s
+  LEFT JOIN login_hour_actual a ON a.hour_index=h.hour_index AND a.cohort=c.cohort AND a.signal=s.signal
+),
+login_group_metrics AS (
+  SELECT cohort,signal,SUM(qualified_attempts) qualified_attempts,
+    SUM(evaluated_attempts) evaluated_attempts,SUM(triggered_attempts) triggered_attempts,
+    SUM(unknown_attempts) unknown_attempts
+  FROM login_hourly GROUP BY 1,2
+),
 records AS (
   SELECT 'COHORT_DEVICE' record_type,OBJECT_CONSTRUCT_KEEP_NULL(
     'metric','live_active_android_device_snapshot','device_id',device_id,'user_id',user_id,
@@ -524,7 +702,7 @@ records AS (
     'baseline_exclusion','any observed cohort owner in the common window',
     'ownership_window','common [chart_start,cutoff); earlier device owners are not established',
     'baseline_sample_is_deterministic',TRUE,
-    'mapping','unique positive member / SDK device / registration across AUTHN and status stream',
+    'mapping','unique positive member / SDK device / registration across AUTHN and status stream; 24h pre-window evidence included',
     'app_open_bridge_enabled',TRUE,
     'app_open_bridge_source','DEVICE_EVENTS_V1_REGISTRATION_STATUS_UPDATED',
     'app_open_bridge_platform','DEVICE_PLATFORM_ANDROID_APP',
@@ -552,6 +730,41 @@ records AS (
       'any_controlling_evaluated_devices',any_controlling_evaluated_devices,
       'any_controlling_positive_devices',any_controlling_positive_devices)) FROM group_metrics))
   FROM params p
+  UNION ALL
+  SELECT 'COHORT_LOGIN_HOURLY',OBJECT_CONSTRUCT_KEEP_NULL(
+    'metric','qualified_android_login_signal_hourly','cohort',cohort,'signal',signal,
+    'hour_index',hour_index,'hour_start',hour_start,'hour_end',hour_end,
+    'qualified_attempts',qualified_attempts,'evaluated_attempts',evaluated_attempts,
+    'triggered_attempts',triggered_attempts,'unknown_attempts',unknown_attempts)
+  FROM login_hourly
+  UNION ALL
+  SELECT 'COHORT_LOGIN_COVERAGE',OBJECT_CONSTRUCT_KEEP_NULL(
+    'metric','qualified_android_login_signal_hourly','scope','run','status','available',
+    'extraction_complete',TRUE,'chart_start',p.chart_start,'window_start',p.chart_start,
+    'cutoff',p.cutoff,'window_end_exclusive',TRUE,
+    'expected_hourly_rows',1344,'emitted_hourly_rows',(SELECT COUNT(*) FROM login_hourly),
+    'pi_lookup_start',p.pi_start,'pi_max_age_hours',p.pi_max_age_hours,
+    'qualified_attempts',(SELECT COUNT(*) FROM qualified_login_attempts),
+    'cohort_members',(SELECT COUNT(*) FROM cohort_users),
+    'baseline_sample_limit',p.baseline_limit,'baseline_sampled_devices',(SELECT COUNT(*) FROM baseline_sample),
+    'full_eligible_baseline_devices',(SELECT COUNT(*) FROM device_state WHERE cohort='baseline' AND ownership_eligible),
+    'attempt_key','ACCOUNT_ACCESS_ATTEMPT_ID; exactly one distinct live DECISION_ID',
+    'attempt_filter','production AUTHN atom_event/member_logins Android; duplicate atom_model copy excluded; positive unique member and SDK device; outcome unrestricted',
+    'attempt_time','MIN(original_timestamp) across bounded eight-day production Android login observations; chart counts first observations in seven-day interval',
+    'registration_rule','one exact registration_id present at first login observation and consistent through observed stages; missing/multiple registration IDs remain qualified but signal unknown',
+    'pi_lookup','latest valid HTTP2xx/object callback observed at or before attempt on exact owner/SDKdevice/registration, no older than 24 hours; latest unevaluated remains unknown',
+    'pi_future_callbacks_used',FALSE,'attestation_request_binding_checked',FALSE,
+    'volume_label','login attempts with signal, latest prior PI within 24h',
+    'ownership_caveat','whole-window device and registration ambiguity exclusions may use ownership learned after an attempt; mapping_first_at must be <= attempt; these are reconstructed event-time signals, not point-in-time warehouse availability',
+    'baseline_rule','all qualified attempts on deterministic bounded other-active-Android device sample; compare signal/evaluated-attempt rates, never raw baseline sample volume as population',
+    'missing_attempt_id_login_rows',(SELECT COUNT(*) FROM login_rows CROSS JOIN params z WHERE observed_at>=z.chart_start AND (attempt_id IS NULL OR UPPER(attempt_id)='NOT FOUND')),
+    'excluded_ambiguous_identity_or_decision_attempts',(SELECT COUNT(*) FROM login_attempt_rollup CROSS JOIN params z WHERE attempt_at>=z.chart_start AND (positive_users<>1 OR sdk_devices<>1 OR live_decisions<>1 OR invalid_owner_rows>0)),
+    'lookup_status_counts',(SELECT ARRAY_AGG(OBJECT_CONSTRUCT_KEEP_NULL('cohort',cohort,'status',lookup_status,'attempts',n)) FROM (SELECT cohort,lookup_status,COUNT(*) n FROM login_attempt_signals GROUP BY 1,2)),
+    'group_metrics',(SELECT ARRAY_AGG(OBJECT_CONSTRUCT_KEEP_NULL(
+      'cohort',cohort,'signal',signal,'qualified_attempts',qualified_attempts,
+      'evaluated_attempts',evaluated_attempts,'triggered_attempts',triggered_attempts,
+      'unknown_attempts',unknown_attempts)) FROM login_group_metrics))
+  FROM params p
 )
 SELECT record_type,payload FROM records
-ORDER BY record_type,payload:cohort::STRING,payload:device_id::STRING;
+ORDER BY record_type,payload:cohort::STRING,payload:signal::STRING,payload:hour_index::NUMBER,payload:device_id::STRING;

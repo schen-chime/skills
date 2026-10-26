@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfoNotFoundError
 
+from login_volume_report import append_login_volume_report
 from dashboard_adapter import PROJECT_ID, build_cohort_user_sql, build_main_sql, load_dashboard_source
 from cohort_report import (
     append_cohort_report, configure_dashboard_labels, normalize_dashboard_html_labels,
@@ -326,7 +327,13 @@ def run(args):
         report = configure_dashboard_labels(build_report(final_rows, args.as_of, args.timezone))
         _write_dashboard_report(report, out_dir)
         cohort_summary = append_cohort_report(out_dir, combined, cutoff, dashboard_success_policy_allowed=True)
-        final_status = "PARTIAL" if cohort_summary["status"] != "AVAILABLE" else report["status"]
+        try:
+            login_summary = append_login_volume_report(out_dir, combined, cutoff, timezone=args.timezone)
+        except RECOVERABLE as exc:
+            manifest["phase_errors"]["login_volume"] = str(exc)
+            login_summary = append_login_volume_report(out_dir, [], cutoff, timezone=args.timezone)
+        manifest["phases"]["login_volume"] = login_summary["status"].lower()
+        final_status = "PARTIAL" if cohort_summary["status"] != "AVAILABLE" or login_summary["status"] != "AVAILABLE" else report["status"]
         manifest["status"] = final_status
         manifest["completed_at_utc"] = iso_utc(datetime.now(UTC))
         _manifest_write(out_dir, manifest)
@@ -334,6 +341,7 @@ def run(args):
             "status": final_status, "as_of_utc": iso_utc(cutoff),
             "new_users": report["counts"]["new_users"],
             "cohort_status": cohort_summary["status"],
+            "login_volume_status": login_summary["status"],
             "report": str((out_dir / "report.html").resolve()),
             "manifest": str((out_dir / "manifest.json").resolve()),
         }

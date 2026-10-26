@@ -91,7 +91,8 @@ class CohortAggregationTests(unittest.TestCase):
         self.assertIn("unknown_controlling", result["devices"][0]["conflicting_fields"])
 
     def test_latest_negative_wins_over_prior_positive(self):
-        result = summarize_cohort([coverage(), device(latest_observed_at="2026-10-25T14:00:00Z"), device(unknown_controlling=False, first_positive_at=None, last_positive_at=None)], CUTOFF)
+        rows = [device(latest_observed_at="2026-10-25T14:00:00Z"), device(unknown_controlling=False, first_positive_at=None, last_positive_at=None)]
+        result = summarize_cohort([coverage(rows), *rows], CUTOFF)
         self.assertEqual(metric(result)["positive_devices"], 0)
         self.assertEqual(metric(result)["observed_devices"], 1)
         self.assertEqual(result["devices"][0]["distinct_source_row_count"], 2)
@@ -112,14 +113,16 @@ class CohortAggregationTests(unittest.TestCase):
         self.assertEqual(result["status"], "AVAILABLE")
 
     def test_window_is_half_open_and_cannot_use_future(self):
-        rows = [coverage(), device("start", latest_observed_at="2026-10-19T15:00:00Z"), device("old", latest_observed_at="2026-10-19T14:59:59Z"), device("at-cutoff", latest_observed_at="2026-10-26T15:00:00Z")]
-        result = summarize_cohort(rows, CUTOFF)
+        rows = [device("start", latest_observed_at="2026-10-19T15:00:00Z"), device("old", latest_observed_at="2026-10-19T14:59:59Z"), device("at-cutoff", latest_observed_at="2026-10-26T15:00:00Z")]
+        result = summarize_cohort([coverage(rows), *rows], CUTOFF)
         self.assertEqual(metric(result)["all_eligible_devices"], 3)
         self.assertEqual(metric(result)["positive_devices"], 1)
         self.assertEqual(metric(result)["unknown_devices"], 2)
 
     def test_each_signal_has_its_own_observed_denominator(self):
-        result = summarize_cohort([coverage(), device(known_controlling=None, app_access_evaluated=False)], CUTOFF)
+        rows = [device(known_controlling=None, app_access_evaluated=False)]
+        result = summarize_cohort([coverage(rows), *rows], CUTOFF)
+        self.assertEqual(result["status"], "AVAILABLE")
         self.assertEqual(metric(result)["positive_devices"], 1)
         self.assertEqual(metric(result)["observed_devices"], 1)
         self.assertEqual(metric(result, "known_controlling")["observed_devices"], 0)
@@ -128,7 +131,9 @@ class CohortAggregationTests(unittest.TestCase):
         self.assertEqual(result["populations"][0]["fully_evaluated_devices"], 0)
 
     def test_unknown_known_and_both_are_not_exclusive(self):
-        result = summarize_cohort([coverage(), device("unknown"), device("known", unknown_controlling=False, known_controlling=True), device("both", unknown_controlling=True, known_controlling=True), device("neither", unknown_controlling=False, known_controlling=False)], CUTOFF)
+        rows = [device("unknown"), device("known", unknown_controlling=False, known_controlling=True), device("both", unknown_controlling=True, known_controlling=True), device("neither", unknown_controlling=False, known_controlling=False)]
+        result = summarize_cohort([coverage(rows), *rows], CUTOFF)
+        self.assertEqual(result["status"], "AVAILABLE")
         self.assertEqual(metric(result)["positive_devices"], 2)
         self.assertEqual(metric(result, "known_controlling")["positive_devices"], 2)
         self.assertEqual(metric(result, "known_only_controlling")["positive_devices"], 1)
@@ -145,7 +150,8 @@ class CohortAggregationTests(unittest.TestCase):
             summarize_cohort([coverage(), device(valid_callbacks=-1)], CUTOFF)
 
     def test_historical_context_is_fixed_and_separate_from_live_zero(self):
-        result = summarize_cohort([coverage(), device(unknown_controlling=False, known_controlling=False)], CUTOFF)
+        rows = [device(unknown_controlling=False, known_controlling=False)]
+        result = summarize_cohort([coverage(rows), *rows], CUTOFF)
         self.assertEqual(metric(result)["positive_devices"], 0)
         historical = result["historical_benchmark"]
         self.assertEqual(historical["original_population"], {"campaign": 1259, "baseline": 5893})
