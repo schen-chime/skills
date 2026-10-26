@@ -1,4 +1,4 @@
 interface:
   display_name: "HK Trend Monitor"
-  short_description: "Track campaign additions and hourly HK email changes"
+  short_description: "Track HK trends and Play Integrity cohort risks"
   default_prompt: "Use $hk-trend-monitor to report the HK campaign at the date and 24-hour time I provide."

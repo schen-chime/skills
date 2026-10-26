@@ -128,7 +128,7 @@ pi_valid AS (
   WHERE http_success AND NOT vendor_user_conflict
     AND TYPEOF(token_payload)='OBJECT' AND variant_count=1
 ),
--- Six standardized nullable booleans per valid callback give each signal its own
+-- Nine standardized nullable booleans per valid callback give each signal its own
 -- evaluated denominator. A raw enum's absence is not itself an evaluated negative.
 -- An explicit recognized positive remains true even alongside an unknown value.
 -- A negative requires a nonempty array made entirely of the known evaluated enums;
@@ -139,6 +139,8 @@ pi_app_array_stats AS (
       'KNOWN_CONTROLLING','UNKNOWN_CONTROLLING','KNOWN_CAPTURING','UNKNOWN_CAPTURING',
       'KNOWN_OVERLAYS','UNKNOWN_OVERLAYS')) known_evaluated_items,
     COUNT_IF(a.value::STRING IN ('KNOWN_CONTROLLING','UNKNOWN_CONTROLLING')) controlling_items,
+    COUNT_IF(a.value::STRING='UNKNOWN_CONTROLLING') unknown_controlling_items,
+    COUNT_IF(a.value::STRING='KNOWN_CONTROLLING') known_controlling_items,
     COUNT_IF(a.value::STRING IN ('KNOWN_CAPTURING','UNKNOWN_CAPTURING')) capturing_items,
     COUNT_IF(a.value::STRING IN ('KNOWN_OVERLAYS','UNKNOWN_OVERLAYS')) overlay_items
   FROM pi_valid v,
@@ -150,6 +152,8 @@ pi_app_evaluation AS (
   SELECT v.*,COALESCE(a.app_access_items,0) app_access_items,
     COALESCE(a.known_evaluated_items,0) known_evaluated_items,
     COALESCE(a.controlling_items,0) controlling_items,
+    COALESCE(a.unknown_controlling_items,0) unknown_controlling_items,
+    COALESCE(a.known_controlling_items,0) known_controlling_items,
     COALESCE(a.capturing_items,0) capturing_items,
     COALESCE(a.overlay_items,0) overlay_items,
     COALESCE(TYPEOF(v.token_payload:environmentDetails:appAccessRiskVerdict:appsDetected)='ARRAY'
@@ -186,6 +190,16 @@ pi_standardized AS (
   SELECT v.*, f.key::STRING signal_name,
     IFF(IS_NULL_VALUE(f.value),NULL::BOOLEAN,f.value::BOOLEAN) risky
   FROM pi_evaluation v,LATERAL FLATTEN(INPUT=>OBJECT_CONSTRUCT_KEEP_NULL(
+    'play_integrity:non_play_controlling',
+      CASE WHEN v.unknown_controlling_items>0 THEN TRUE
+        WHEN v.app_access_negative_evaluable THEN FALSE ELSE NULL::BOOLEAN END,
+    'play_integrity:play_known_controlling',
+      CASE WHEN v.known_controlling_items>0 THEN TRUE
+        WHEN v.app_access_negative_evaluable THEN FALSE ELSE NULL::BOOLEAN END,
+    'play_integrity:known_only_controlling',
+      CASE WHEN v.unknown_controlling_items>0 THEN FALSE
+        WHEN v.known_controlling_items>0 AND v.app_access_negative_evaluable THEN TRUE
+        WHEN v.app_access_negative_evaluable THEN FALSE ELSE NULL::BOOLEAN END,
     'play_integrity:app_access_controlling',
       CASE WHEN TYPEOF(v.token_payload:environmentDetails:appAccessRiskVerdict:appsDetected)='ARRAY' AND v.controlling_items>0 THEN TRUE
         WHEN v.app_access_negative_evaluable THEN FALSE
